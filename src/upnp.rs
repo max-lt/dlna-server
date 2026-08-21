@@ -1,0 +1,430 @@
+//! UPnP/DLNA payloads: device description, SCPDs, and the SOAP control endpoints.
+
+use crate::Server;
+use crate::library::{Item, Kind};
+
+/// `DLNA.ORG_OP=01` advertises byte-seek support, which is what makes a TV's
+/// scrub bar work; the flags word marks the resource as streamable.
+pub const RES_FLAGS: &str = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;\
+DLNA.ORG_FLAGS=01700000000000000000000000000000";
+
+pub const SERVER_HEADER: &str = "UPnP/1.0 DLNA/1.50 dlna-server/0.1";
+
+pub const CONTENT_DIRECTORY: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
+pub const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
+
+const DIDL_OPEN: &str = concat!(
+    r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" "#,
+    r#"xmlns:dc="http://purl.org/dc/elements/1.1/" "#,
+    r#"xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" "#,
+    r#"xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" "#,
+    r#"xmlns:sec="http://www.sec.co.kr/">"#
+);
+
+/// The root device document a control point fetches from `LOCATION`.
+pub fn description(srv: &Server) -> String {
+    let name = escape(&srv.name);
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <friendlyName>{name}</friendlyName>
+    <manufacturer>dlna-server</manufacturer>
+    <manufacturerURL>https://github.com/</manufacturerURL>
+    <modelName>dlna-server</modelName>
+    <modelNumber>0.1</modelNumber>
+    <modelDescription>DLNA media server in Rust</modelDescription>
+    <serialNumber>{uuid}</serialNumber>
+    <UDN>uuid:{uuid}</UDN>
+    <presentationURL>/</presentationURL>
+    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMS-1.50</dlna:X_DLNADOC>
+    <serviceList>
+      <service>
+        <serviceType>{CONTENT_DIRECTORY}</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>
+        <SCPDURL>/scpd/cd.xml</SCPDURL>
+        <controlURL>/ctl/cd</controlURL>
+        <eventSubURL>/evt/cd</eventSubURL>
+      </service>
+      <service>
+        <serviceType>{CONNECTION_MANAGER}</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+        <SCPDURL>/scpd/cm.xml</SCPDURL>
+        <controlURL>/ctl/cm</controlURL>
+        <eventSubURL>/evt/cm</eventSubURL>
+      </service>
+    </serviceList>
+  </device>
+</root>
+"#,
+        uuid = srv.uuid
+    )
+}
+
+pub const CD_SCPD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action>
+      <name>Browse</name>
+      <argumentList>
+        <argument><name>ObjectID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>
+        <argument><name>BrowseFlag</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable></argument>
+        <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>
+        <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>
+        <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>
+        <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>
+        <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetSearchCapabilities</name>
+      <argumentList><argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument></argumentList>
+    </action>
+    <action>
+      <name>GetSortCapabilities</name>
+      <argumentList><argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable></argument></argumentList>
+    </action>
+    <action>
+      <name>GetSystemUpdateID</name>
+      <argumentList><argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument></argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType>
+      <allowedValueList><allowedValue>BrowseMetadata</allowedValue><allowedValue>BrowseDirectChildren</allowedValue></allowedValueList>
+    </stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Filter</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>
+  </serviceStateTable>
+</scpd>
+"#;
+
+pub const CM_SCPD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action>
+      <name>GetProtocolInfo</name>
+      <argumentList>
+        <argument><name>Source</name><direction>out</direction><relatedStateVariable>SourceProtocolInfo</relatedStateVariable></argument>
+        <argument><name>Sink</name><direction>out</direction><relatedStateVariable>SinkProtocolInfo</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetCurrentConnectionIDs</name>
+      <argumentList><argument><name>ConnectionIDs</name><direction>out</direction><relatedStateVariable>CurrentConnectionIDs</relatedStateVariable></argument></argumentList>
+    </action>
+    <action>
+      <name>GetCurrentConnectionInfo</name>
+      <argumentList>
+        <argument><name>ConnectionID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable></argument>
+        <argument><name>RcsID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_RcsID</relatedStateVariable></argument>
+        <argument><name>AVTransportID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_AVTransportID</relatedStateVariable></argument>
+        <argument><name>ProtocolInfo</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ProtocolInfo</relatedStateVariable></argument>
+        <argument><name>PeerConnectionManager</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionManager</relatedStateVariable></argument>
+        <argument><name>PeerConnectionID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable></argument>
+        <argument><name>Direction</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Direction</relatedStateVariable></argument>
+        <argument><name>Status</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionStatus</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable>
+    <stateVariable sendEvents="yes"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>CurrentConnectionIDs</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ConnectionStatus</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ConnectionManager</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Direction</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ProtocolInfo</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ConnectionID</name><dataType>i4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_AVTransportID</name><dataType>i4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_RcsID</name><dataType>i4</dataType></stateVariable>
+  </serviceStateTable>
+</scpd>
+"#;
+
+/// Returns the HTTP status and body for one SOAP call.
+pub fn control(
+    srv: &Server,
+    service: &str,
+    soap_action: Option<&str>,
+    body: &[u8],
+) -> (u16, String) {
+    let action = soap_action
+        .and_then(|a| a.rsplit_once('#'))
+        .map(|(_, name)| name.trim_end_matches('"'))
+        .unwrap_or("");
+    let body = String::from_utf8_lossy(body);
+
+    match (service, action) {
+        (CONTENT_DIRECTORY, "Browse") => browse(srv, &body),
+        (CONTENT_DIRECTORY, "GetSearchCapabilities") => {
+            (200, envelope(service, action, "<SearchCaps></SearchCaps>"))
+        }
+        (CONTENT_DIRECTORY, "GetSortCapabilities") => (
+            200,
+            envelope(service, action, "<SortCaps>dc:title</SortCaps>"),
+        ),
+        (CONTENT_DIRECTORY, "GetSystemUpdateID") => (200, envelope(service, action, "<Id>1</Id>")),
+        (CONNECTION_MANAGER, "GetProtocolInfo") => (
+            200,
+            envelope(
+                service,
+                action,
+                &format!(
+                    "<Source>{}</Source><Sink></Sink>",
+                    escape(&protocol_info(srv))
+                ),
+            ),
+        ),
+        (CONNECTION_MANAGER, "GetCurrentConnectionIDs") => (
+            200,
+            envelope(service, action, "<ConnectionIDs>0</ConnectionIDs>"),
+        ),
+        (CONNECTION_MANAGER, "GetCurrentConnectionInfo") => (
+            200,
+            envelope(
+                service,
+                action,
+                "<RcsID>-1</RcsID><AVTransportID>-1</AVTransportID><ProtocolInfo></ProtocolInfo>\
+                 <PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID>\
+                 <Direction>Output</Direction><Status>OK</Status>",
+            ),
+        ),
+        _ => fault(401, "Invalid Action"),
+    }
+}
+
+fn browse(srv: &Server, body: &str) -> (u16, String) {
+    let object_id: u32 = tag(body, "ObjectID")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let metadata_only = tag(body, "BrowseFlag") == Some("BrowseMetadata");
+    let start: usize = tag(body, "StartingIndex")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let requested: usize = tag(body, "RequestedCount")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let lib = srv.library();
+    let Some(item) = lib.get(object_id) else {
+        return fault(701, "No such object");
+    };
+
+    let mut didl = String::from(DIDL_OPEN);
+    let (returned, total) = if metadata_only {
+        didl.push_str(&render(srv, item));
+        (1, 1)
+    } else {
+        let total = item.children.len();
+        // A count of zero means "everything from StartingIndex on".
+        let count = if requested == 0 { total } else { requested };
+        let mut returned = 0;
+        for &child in item.children.iter().skip(start).take(count) {
+            if let Some(child) = lib.get(child) {
+                didl.push_str(&render(srv, child));
+                returned += 1;
+            }
+        }
+        (returned, total)
+    };
+    didl.push_str("</DIDL-Lite>");
+
+    let payload = format!(
+        "<Result>{}</Result><NumberReturned>{returned}</NumberReturned>\
+         <TotalMatches>{total}</TotalMatches><UpdateID>1</UpdateID>",
+        escape(&didl)
+    );
+    (200, envelope(CONTENT_DIRECTORY, "Browse", &payload))
+}
+
+/// One DIDL-Lite `<container>` or `<item>` element.
+fn render(srv: &Server, item: &Item) -> String {
+    // The root container reports a parent of -1 per the ContentDirectory spec.
+    let parent = if item.id == 0 {
+        "-1".to_string()
+    } else {
+        item.parent.to_string()
+    };
+    let title = escape(&item.title);
+    let class = item.kind.upnp_class();
+
+    if item.kind == Kind::Folder {
+        return format!(
+            r#"<container id="{}" parentID="{parent}" restricted="1" childCount="{}" searchable="0">"#,
+            item.id,
+            item.children.len()
+        ) + &format!(
+            "<dc:title>{title}</dc:title><upnp:class>{class}</upnp:class></container>"
+        );
+    }
+
+    let base = srv.base_url();
+    let mut out = format!(
+        r#"<item id="{}" parentID="{parent}" restricted="1"><dc:title>{title}</dc:title>"#,
+        item.id
+    );
+    out.push_str(&format!("<upnp:class>{class}</upnp:class>"));
+
+    if item.subtitle.is_some() {
+        // Samsung's extension, which LG's webOS player also honours.
+        out.push_str(&format!(
+            r#"<sec:CaptionInfoEx sec:type="srt">{base}/sub/{id}.srt</sec:CaptionInfoEx>"#,
+            id = item.id
+        ));
+        out.push_str(&format!(
+            r#"<res protocolInfo="http-get:*:text/srt:*">{base}/sub/{id}.srt</res>"#,
+            id = item.id
+        ));
+    }
+
+    // Some renderers sniff the URL extension before reading the MIME type.
+    let ext = item.path.extension().map_or_else(String::new, |ext| {
+        format!(".{}", ext.to_string_lossy().to_lowercase())
+    });
+    out.push_str(&format!(
+        r#"<res protocolInfo="http-get:*:{mime}:{RES_FLAGS}" size="{size}">{base}/media/{id}{ext}</res>"#,
+        mime = item.mime,
+        size = item.size,
+        id = item.id,
+    ));
+    out.push_str("</item>");
+    out
+}
+
+/// Every MIME type actually present, so a picky renderer sees a matching entry.
+fn protocol_info(srv: &Server) -> String {
+    let lib = srv.library();
+    let mut mimes: Vec<&str> = lib
+        .items
+        .iter()
+        .filter(|i| i.kind != Kind::Folder)
+        .map(|i| i.mime)
+        .collect();
+    mimes.sort_unstable();
+    mimes.dedup();
+    if mimes.is_empty() {
+        mimes.push("video/mp4");
+    }
+    mimes
+        .iter()
+        .map(|m| format!("http-get:*:{m}:{RES_FLAGS}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn envelope(service: &str, action: &str, payload: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body><u:{action}Response xmlns:u="{service}">{payload}</u:{action}Response></s:Body></s:Envelope>
+"#
+    )
+}
+
+fn fault(code: u32, description: &str) -> (u16, String) {
+    (
+        500,
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>
+<detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
+<errorCode>{code}</errorCode><errorDescription>{description}</errorDescription>
+</UPnPError></detail></s:Fault></s:Body></s:Envelope>
+"#
+        ),
+    )
+}
+
+/// Reads `<Name>value</Name>`, ignoring any namespace prefix on the tag.
+fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("{name}>");
+    let rest = &xml[xml.find(&open)? + open.len()..];
+    Some(rest[..rest.find("</")?].trim())
+}
+
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Derived from the server's identity, so a restart reuses the TV's existing
+/// entry instead of adding a duplicate.
+pub fn stable_uuid(seed: &str) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv1a(seed.as_bytes(), 0xcbf2_9ce4_8422_2325).to_be_bytes());
+    bytes[8..].copy_from_slice(&fnv1a(seed.as_bytes(), 0x9e37_79b9_7f4a_7c15).to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn fnv1a(data: &[u8], offset: u64) -> u64 {
+    let mut hash = offset;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape, stable_uuid, tag};
+
+    #[test]
+    fn tag_ignores_namespace_prefixes() {
+        assert_eq!(tag("<u:ObjectID>42</u:ObjectID>", "ObjectID"), Some("42"));
+        assert_eq!(tag("<ObjectID> 7 </ObjectID>", "ObjectID"), Some("7"));
+        assert_eq!(tag("<Other>1</Other>", "ObjectID"), None);
+    }
+
+    #[test]
+    fn titles_are_xml_safe() {
+        assert_eq!(escape("Fish & Chips <2>"), "Fish &amp; Chips &lt;2&gt;");
+    }
+
+    #[test]
+    fn uuid_is_stable_and_well_formed() {
+        let uuid = stable_uuid("Rust DLNA|/Users/max/Movies");
+        assert_eq!(uuid, stable_uuid("Rust DLNA|/Users/max/Movies"));
+        assert_ne!(uuid, stable_uuid("Rust DLNA|/Users/max/Films"));
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(uuid.as_bytes()[14], b'4');
+    }
+}
