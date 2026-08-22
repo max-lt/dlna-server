@@ -4,7 +4,7 @@ A DLNA (UPnP AV) media server. Point it at a folder, browse it from the TV.
 
 No dependencies, `std` alone. SSDP discovery, the ContentDirectory SOAP service
 and HTTP range streaming are all implemented here, which is why the release
-binary is 442 KB and links nothing but libSystem.
+binary is 459 KB and links nothing but libSystem.
 
 ## Usage
 
@@ -23,6 +23,7 @@ ARGS:
 OPTIONS:
     -p, --port <PORT>    HTTP port (default: 8200)
     -n, --name <NAME>    Name shown on the TV (default: "Rust DLNA")
+    -w, --watch <SECS>   Rescan interval, 0 to disable (default: 30)
         --ip <ADDR>      LAN address to advertise (default: autodetected)
     -h, --help           Print this help
 ```
@@ -31,8 +32,9 @@ The server shows up in the TV's media player within a few seconds. On webOS it
 appears in the Media Player app's device list. `Ctrl-C` withdraws the
 advertisement, so it disappears again straight away.
 
-Files added after startup are picked up by `curl http://<addr>:<port>/rescan`.
-That URL and the status page at `/` are the whole management interface.
+Files added or removed while it runs are picked up within the rescan interval.
+`curl http://<addr>:<port>/rescan` forces one immediately; that URL and the
+status page at `/` are the whole management interface.
 
 ## What it does
 
@@ -44,6 +46,10 @@ That URL and the status page at `/` are the whole management interface.
   forms, so seeking and resume work. Files are streamed in 128 KB chunks.
 - **Subtitles.** A `.srt` next to a video is offered as a second `<res>` and via
   `sec:CaptionInfoEx`, which LG and Samsung sets read.
+- **Change detection.** A timer rescans the tree and swaps the library only when
+  a fingerprint over paths, sizes and mtimes moves. Object ids survive a rescan,
+  so an id a TV cached still resolves to the file it asked for, and
+  `SystemUpdateID` advances to tell a control point to browse again.
 
 There is no transcoding: the renderer gets the original bytes. That covers most
 containers an LG set will meet, but an exotic codec fails to play rather than
@@ -68,3 +74,8 @@ nothing.
 
 The advertised address is taken from the default route. With a VM bridge or a
 VPN in play, pass `--ip` to pin the interface the TV is actually on.
+
+Change detection is a `stat` sweep, not FSEvents: no `unsafe` FFI, and it works
+the same on Linux. The sweep is served from the VFS cache in the normal case,
+but on a library kept on an external disk that is allowed to spin down, prefer
+`--watch 0` and the `/rescan` endpoint.

@@ -9,13 +9,19 @@ mod upnp;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::Duration;
 
 use library::Library;
 
 const DEFAULT_PORT: u16 = 8200;
+/// Long enough that the stat sweep stays invisible, short enough that a file
+/// dropped in shows up before you reach for the remote.
+const DEFAULT_WATCH: Duration = Duration::from_secs(30);
+
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -26,6 +32,7 @@ pub struct Server {
     pub port: u16,
     pub root: PathBuf,
     lib: RwLock<Arc<Library>>,
+    update_id: AtomicU32,
 }
 
 impl Server {
@@ -33,15 +40,37 @@ impl Server {
         Arc::clone(&self.lib.read().unwrap())
     }
 
-    pub fn rescan(&self) -> Arc<Library> {
-        let fresh = Arc::new(Library::scan(&self.root, &self.name));
+    /// Rescans, swapping the library in only if the tree actually changed.
+    pub fn rescan(&self) -> (Arc<Library>, bool) {
+        let current = self.library();
+        let fresh = Library::scan(&self.root, &self.name, Some(&current));
+        if fresh.fingerprint == current.fingerprint {
+            return (current, false);
+        }
+        let fresh = Arc::new(fresh);
         *self.lib.write().unwrap() = Arc::clone(&fresh);
-        fresh
+        self.update_id.fetch_add(1, Ordering::Relaxed);
+        (fresh, true)
+    }
+
+    /// `SystemUpdateID`: a control point re-browses when this changes.
+    pub fn update_id(&self) -> u32 {
+        self.update_id.load(Ordering::Relaxed)
     }
 
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.ip, self.port)
     }
+}
+
+/// FNV-1a, for the device UUID and the library fingerprint.
+pub fn fnv1a(seed: u64, data: &[u8]) -> u64 {
+    let mut hash = seed;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn main() -> ExitCode {
@@ -73,7 +102,7 @@ fn run(options: Options) -> std::io::Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, options.port))?;
     let port = listener.local_addr()?.port();
 
-    let library = Library::scan(&options.dir, &options.name);
+    let library = Library::scan(&options.dir, &options.name, None);
     println!(
         "{}: {} folders, {} files under {}",
         options.name,
@@ -92,22 +121,46 @@ fn run(options: Options) -> std::io::Result<()> {
         port,
         root: options.dir,
         lib: RwLock::new(Arc::new(library)),
+        update_id: AtomicU32::new(1),
     });
 
     http::serve(listener, Arc::clone(&srv));
     ssdp::start(Arc::clone(&srv))?;
+    if let Some(interval) = options.watch {
+        watch_library(Arc::clone(&srv), interval);
+    }
 
     println!("listening on {}  (uuid:{})", srv.base_url(), srv.uuid);
+    match options.watch {
+        Some(interval) => println!("rescanning every {}s", interval.as_secs()),
+        None => println!("rescan on demand at {}/rescan", srv.base_url()),
+    }
     println!("announcing over SSDP; pick it up from the TV's media player");
 
     net::on_terminate(on_signal);
     while !SHUTDOWN.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
     }
 
     println!("\nshutting down, withdrawing announcements");
     ssdp::byebye(&srv);
     Ok(())
+}
+
+/// Rescans on a timer, so files added or removed reach the TV without a restart.
+fn watch_library(srv: Arc<Server>, interval: Duration) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+            let (lib, changed) = srv.rescan();
+            if changed {
+                println!(
+                    "library changed: {} folders, {} files",
+                    lib.folders, lib.files
+                );
+            }
+        }
+    });
 }
 
 extern "C" fn on_signal(_signal: i32) {
@@ -119,6 +172,7 @@ struct Options {
     name: String,
     port: u16,
     ip: Option<Ipv4Addr>,
+    watch: Option<Duration>,
 }
 
 impl Options {
@@ -128,6 +182,7 @@ impl Options {
         let mut name = None;
         let mut port = DEFAULT_PORT;
         let mut ip = None;
+        let mut watch = Some(DEFAULT_WATCH);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -143,6 +198,12 @@ impl Options {
                         .map_err(|_| "--port must be a number".to_string())?;
                 }
                 "-n" | "--name" => name = Some(value("--name")?),
+                "-w" | "--watch" => {
+                    let seconds: u64 = value("--watch")?
+                        .parse()
+                        .map_err(|_| "--watch must be a number of seconds".to_string())?;
+                    watch = (seconds > 0).then(|| Duration::from_secs(seconds));
+                }
                 "--ip" => {
                     ip = Some(
                         value("--ip")?
@@ -171,6 +232,7 @@ impl Options {
             dir,
             port,
             ip,
+            watch,
         }))
     }
 }
@@ -187,8 +249,9 @@ ARGS:
 OPTIONS:
     -p, --port <PORT>    HTTP port (default: 8200)
     -n, --name <NAME>    Name shown on the TV (default: \"Rust DLNA\")
+    -w, --watch <SECS>   Rescan interval, 0 to disable (default: 30)
         --ip <ADDR>      LAN address to advertise (default: autodetected)
     -h, --help           Print this help
 
-Visit http://<addr>:<port>/rescan to pick up files added since startup.
+A rescan can also be triggered on demand at http://<addr>:<port>/rescan.
 ";

@@ -139,8 +139,9 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
             send(&mut stream, 200, TEXT, &headers, b"", Body::Send)
         }
         ("GET" | "HEAD", "/rescan") => {
-            let lib = srv.rescan();
-            let report = format!("{} folders, {} files\n", lib.folders, lib.files);
+            let (lib, changed) = srv.rescan();
+            let state = if changed { "updated" } else { "unchanged" };
+            let report = format!("{state}: {} folders, {} files\n", lib.folders, lib.files);
             print!("rescan: {report}");
             send(&mut stream, 200, TEXT, &[], report.as_bytes(), body)
         }

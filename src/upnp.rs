@@ -2,13 +2,15 @@
 
 use crate::Server;
 use crate::library::{Item, Kind};
+use crate::{FNV_OFFSET, fnv1a};
 
 /// `DLNA.ORG_OP=01` advertises byte-seek support, which is what makes a TV's
 /// scrub bar work; the flags word marks the resource as streamable.
 pub const RES_FLAGS: &str = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;\
 DLNA.ORG_FLAGS=01700000000000000000000000000000";
 
-pub const SERVER_HEADER: &str = "UPnP/1.0 DLNA/1.50 dlna-server/0.1";
+pub const SERVER_HEADER: &str =
+    concat!("UPnP/1.0 DLNA/1.50 dlna-server/", env!("CARGO_PKG_VERSION"));
 
 pub const CONTENT_DIRECTORY: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
 pub const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
@@ -34,7 +36,7 @@ pub fn description(srv: &Server) -> String {
     <manufacturer>dlna-server</manufacturer>
     <manufacturerURL>https://github.com/</manufacturerURL>
     <modelName>dlna-server</modelName>
-    <modelNumber>0.1</modelNumber>
+    <modelNumber>{version}</modelNumber>
     <modelDescription>DLNA media server in Rust</modelDescription>
     <serialNumber>{uuid}</serialNumber>
     <UDN>uuid:{uuid}</UDN>
@@ -59,7 +61,8 @@ pub fn description(srv: &Server) -> String {
   </device>
 </root>
 "#,
-        uuid = srv.uuid
+        uuid = srv.uuid,
+        version = env!("CARGO_PKG_VERSION")
     )
 }
 
@@ -179,7 +182,10 @@ pub fn control(
             200,
             envelope(service, action, "<SortCaps>dc:title</SortCaps>"),
         ),
-        (CONTENT_DIRECTORY, "GetSystemUpdateID") => (200, envelope(service, action, "<Id>1</Id>")),
+        (CONTENT_DIRECTORY, "GetSystemUpdateID") => {
+            let id = srv.update_id();
+            (200, envelope(service, action, &format!("<Id>{id}</Id>")))
+        }
         (CONNECTION_MANAGER, "GetProtocolInfo") => (
             200,
             envelope(
@@ -247,8 +253,9 @@ fn browse(srv: &Server, body: &str) -> (u16, String) {
 
     let payload = format!(
         "<Result>{}</Result><NumberReturned>{returned}</NumberReturned>\
-         <TotalMatches>{total}</TotalMatches><UpdateID>1</UpdateID>",
-        escape(&didl)
+         <TotalMatches>{total}</TotalMatches><UpdateID>{update}</UpdateID>",
+        escape(&didl),
+        update = srv.update_id()
     );
     (200, envelope(CONTENT_DIRECTORY, "Browse", &payload))
 }
@@ -312,9 +319,9 @@ fn protocol_info(srv: &Server) -> String {
     let lib = srv.library();
     let mut mimes: Vec<&str> = lib
         .items
-        .iter()
-        .filter(|i| i.kind != Kind::Folder)
-        .map(|i| i.mime)
+        .values()
+        .filter(|item| item.kind != Kind::Folder)
+        .map(|item| item.mime)
         .collect();
     mimes.sort_unstable();
     mimes.dedup();
@@ -378,8 +385,8 @@ pub fn escape(text: &str) -> String {
 /// entry instead of adding a duplicate.
 pub fn stable_uuid(seed: &str) -> String {
     let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&fnv1a(seed.as_bytes(), 0xcbf2_9ce4_8422_2325).to_be_bytes());
-    bytes[8..].copy_from_slice(&fnv1a(seed.as_bytes(), 0x9e37_79b9_7f4a_7c15).to_be_bytes());
+    bytes[..8].copy_from_slice(&fnv1a(FNV_OFFSET, seed.as_bytes()).to_be_bytes());
+    bytes[8..].copy_from_slice(&fnv1a(0x9e37_79b9_7f4a_7c15, seed.as_bytes()).to_be_bytes());
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
 
@@ -392,15 +399,6 @@ pub fn stable_uuid(seed: &str) -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-fn fnv1a(data: &[u8], offset: u64) -> u64 {
-    let mut hash = offset;
-    for &byte in data {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[cfg(test)]

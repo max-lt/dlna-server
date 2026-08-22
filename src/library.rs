@@ -1,10 +1,15 @@
-//! Filesystem scan: the media tree flattened into stable, numeric UPnP object IDs.
+//! Filesystem scan: the media tree flattened into numeric UPnP object IDs.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use crate::{FNV_OFFSET, fnv1a};
 
 /// Depth limit, so a pathological tree cannot run the scan away.
 const MAX_DEPTH: u32 = 16;
+const ROOT: u32 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -39,38 +44,58 @@ pub struct Item {
 }
 
 pub struct Library {
-    pub items: Vec<Item>,
+    pub items: HashMap<u32, Item>,
+    /// Ids already handed out, keyed by path. A rescan reuses them, or a TV
+    /// holding an id from before would resolve it to a different file.
+    assigned: HashMap<PathBuf, u32>,
+    next_id: u32,
     pub folders: usize,
     pub files: usize,
+    /// Differs whenever a file is added, removed, replaced or resized.
+    pub fingerprint: u64,
 }
 
 impl Library {
-    /// Walks `root`, keeping only playable files and the folders leading to them.
-    pub fn scan(root: &Path, title: &str) -> Library {
+    /// Walks `root`, keeping only playable files and the folders leading to
+    /// them. Object ids carry over from `previous`.
+    pub fn scan(root: &Path, title: &str, previous: Option<&Library>) -> Library {
         let mut lib = Library {
-            items: vec![Item {
-                id: 0,
-                parent: 0,
+            items: HashMap::new(),
+            assigned: previous.map(|p| p.assigned.clone()).unwrap_or_default(),
+            next_id: previous.map_or(ROOT + 1, |p| p.next_id),
+            folders: 0,
+            files: 0,
+            fingerprint: FNV_OFFSET,
+        };
+        lib.assigned.insert(root.to_path_buf(), ROOT);
+
+        let children = lib.walk(root, ROOT, 0);
+        lib.items.insert(
+            ROOT,
+            Item {
+                id: ROOT,
+                parent: ROOT,
                 title: title.to_string(),
                 path: root.to_path_buf(),
                 kind: Kind::Folder,
                 size: 0,
                 mime: "",
                 subtitle: None,
-                children: Vec::new(),
-            }],
-            folders: 0,
-            files: 0,
-        };
-        let children = lib.walk(root, 0, 0);
-        lib.items[0].children = children;
-        lib.folders = lib.items.iter().filter(|i| i.kind == Kind::Folder).count() - 1;
+                children,
+            },
+        );
+        lib.folders = lib
+            .items
+            .values()
+            .filter(|i| i.kind == Kind::Folder)
+            .count()
+            - 1;
         lib.files = lib.items.len() - 1 - lib.folders;
         lib
     }
 
     pub fn get(&self, id: u32) -> Option<&Item> {
-        self.items.get(id as usize)
+        self.items.get(&id)
     }
 
     /// Adds every playable child of `dir` and returns their ids, in display order.
@@ -87,11 +112,13 @@ impl Library {
                 continue;
             }
             // `file_type` does not follow symlinks, so link cycles cannot trap us.
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() && !ft.is_file() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() && !file_type.is_file() {
                 continue;
             }
-            sorted.push((ft.is_dir(), name.to_lowercase(), entry.path()));
+            sorted.push((file_type.is_dir(), name.to_lowercase(), entry.path()));
         }
         sorted.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
@@ -117,26 +144,30 @@ impl Library {
 
     /// Returns `None` for a folder with no playable content anywhere below it.
     fn add_folder(&mut self, path: &Path, parent: u32, title: String, depth: u32) -> Option<u32> {
-        let id = self.items.len() as u32;
-        self.items.push(Item {
-            id,
-            parent,
-            title,
-            path: path.to_path_buf(),
-            kind: Kind::Folder,
-            size: 0,
-            mime: "",
-            subtitle: None,
-            children: Vec::new(),
-        });
-
+        // Claimed before the walk because the children need it as their parent,
+        // and kept on the pruned path so the folder keeps its id if it later
+        // gains content.
+        let id = self.claim_id(path);
         let children = self.walk(path, id, depth + 1);
         if children.is_empty() {
-            // Nothing was kept below, so nothing above `id` was pushed either.
-            self.items.truncate(id as usize);
             return None;
         }
-        self.items[id as usize].children = children;
+
+        self.stamp(path, 0, 0);
+        self.items.insert(
+            id,
+            Item {
+                id,
+                parent,
+                title,
+                path: path.to_path_buf(),
+                kind: Kind::Folder,
+                size: 0,
+                mime: "",
+                subtitle: None,
+                children,
+            },
+        );
         Some(id)
     }
 
@@ -148,33 +179,63 @@ impl Library {
         kind: Kind,
         mime: &'static str,
     ) -> u32 {
-        let id = self.items.len() as u32;
+        let id = self.claim_id(path);
         let title = name
             .rsplit_once('.')
             .map_or(name.as_str(), |(stem, _)| stem);
-        self.items.push(Item {
+        let metadata = fs::metadata(path);
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = metadata
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+
+        self.stamp(path, size, modified);
+        self.items.insert(
             id,
-            parent,
-            title: title.to_string(),
-            path: path.to_path_buf(),
-            kind,
-            size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-            mime,
-            subtitle: if kind == Kind::Video {
-                find_subtitle(path)
-            } else {
-                None
+            Item {
+                id,
+                parent,
+                title: title.to_string(),
+                path: path.to_path_buf(),
+                kind,
+                size,
+                mime,
+                subtitle: if kind == Kind::Video {
+                    find_subtitle(path)
+                } else {
+                    None
+                },
+                children: Vec::new(),
             },
-            children: Vec::new(),
-        });
+        );
         id
+    }
+
+    fn claim_id(&mut self, path: &Path) -> u32 {
+        if let Some(&id) = self.assigned.get(path) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.assigned.insert(path.to_path_buf(), id);
+        id
+    }
+
+    /// Folds one entry into the fingerprint. The walk is sorted, so the same
+    /// tree always folds in the same order.
+    fn stamp(&mut self, path: &Path, size: u64, modified: u64) {
+        self.fingerprint = fnv1a(self.fingerprint, path.to_string_lossy().as_bytes());
+        self.fingerprint = fnv1a(self.fingerprint, &size.to_le_bytes());
+        self.fingerprint = fnv1a(self.fingerprint, &modified.to_le_bytes());
     }
 }
 
 /// A `.srt` sharing the video's stem, which LG and Samsung sets pick up over HTTP.
 fn find_subtitle(video: &Path) -> Option<PathBuf> {
-    for ext in ["srt", "SRT"] {
-        let candidate = video.with_extension(ext);
+    for extension in ["srt", "SRT"] {
+        let candidate = video.with_extension(extension);
         if candidate != video && candidate.is_file() {
             return Some(candidate);
         }
@@ -183,8 +244,8 @@ fn find_subtitle(video: &Path) -> Option<PathBuf> {
 }
 
 fn classify(path: &Path) -> Option<(Kind, &'static str)> {
-    let ext = path.extension()?.to_string_lossy().to_lowercase();
-    let entry = match ext.as_str() {
+    let extension = path.extension()?.to_string_lossy().to_lowercase();
+    let entry = match extension.as_str() {
         "mkv" => (Kind::Video, "video/x-matroska"),
         "mp4" | "m4v" => (Kind::Video, "video/mp4"),
         "avi" | "divx" => (Kind::Video, "video/x-msvideo"),
