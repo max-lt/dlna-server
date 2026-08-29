@@ -366,6 +366,9 @@ fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     Some(rest[..rest.find("</")?].trim())
 }
 
+/// Escapes `text` for XML, dropping the C0 controls, which XML 1.0 forbids
+/// outright: a filename may legally carry one, and a parser rejects the whole
+/// DIDL over it rather than the one item.
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -375,10 +378,17 @@ pub fn escape(text: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
+            c if xml_allows(c) => out.push(c),
+            _ => {}
         }
     }
     out
+}
+
+/// The `Char` production of XML 1.0. A Rust `char` cannot hold a surrogate, so
+/// that gap in the ranges needs no guard.
+fn xml_allows(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | ' '..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..)
 }
 
 /// Derived from the server's identity, so a restart reuses the TV's existing
@@ -415,6 +425,14 @@ mod tests {
     #[test]
     fn titles_are_xml_safe() {
         assert_eq!(escape("Fish & Chips <2>"), "Fish &amp; Chips &lt;2&gt;");
+    }
+
+    #[test]
+    fn characters_xml_cannot_carry_are_dropped() {
+        assert_eq!(escape("bad\u{1}name\u{8}"), "badname");
+        assert_eq!(escape("\u{b}\u{c}\u{1f}\u{fffe}\u{ffff}"), "");
+        assert_eq!(escape("tab\tlf\ncr\r"), "tab\tlf\ncr\r");
+        assert_eq!(escape("café — naïve 🎬"), "café — naïve 🎬");
     }
 
     #[test]
