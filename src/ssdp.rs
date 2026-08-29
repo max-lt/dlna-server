@@ -3,7 +3,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,15 @@ const PORT: u16 = 1900;
 const MAX_AGE: u32 = 1800;
 /// Re-announce well inside `MAX_AGE` so an announcement lost to UDP costs nothing.
 const REANNOUNCE: Duration = Duration::from_secs(MAX_AGE as u64 / 3);
+
+/// A TV that sees the UUID and the BOOTID both unchanged keeps its cached tree,
+/// and our UUID is stable by design. Seconds since the epoch, in the 31 bits
+/// UPnP allows.
+static BOOT_ID: LazyLock<u32> = LazyLock::new(|| {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| (d.as_secs() as u32) & 0x7fff_ffff)
+});
 
 /// The five identities a MediaServer must announce, as `(NT/ST, USN)` pairs.
 fn identities(uuid: &str) -> Vec<(String, String)> {
@@ -77,6 +86,7 @@ pub fn byebye(srv: &Server) {
 }
 
 fn respond(socket: &UdpSocket, srv: &Server) -> io::Result<()> {
+    let boot = *BOOT_ID;
     let mut buf = [0u8; 2048];
     loop {
         let (len, from) = socket.recv_from(&mut buf)?;
@@ -116,7 +126,7 @@ fn respond(socket: &UdpSocket, srv: &Server) -> io::Result<()> {
                      SERVER: {SERVER_HEADER}\r\n\
                      ST: {st}\r\n\
                      USN: {usn}\r\n\
-                     BOOTID.UPNP.ORG: 1\r\n\
+                     BOOTID.UPNP.ORG: {boot}\r\n\
                      CONFIGID.UPNP.ORG: 1\r\n\r\n"
                 );
                 let _ = socket.send_to(reply.as_bytes(), from);
@@ -132,6 +142,8 @@ fn notify(srv: &Server, nts: &str) -> io::Result<()> {
     let target = SocketAddrV4::new(MULTICAST, PORT);
     let location = format!("{}/desc.xml", srv.base_url());
 
+    let boot = *BOOT_ID;
+
     for (nt, usn) in identities(&srv.uuid) {
         let msg = format!(
             "NOTIFY * HTTP/1.1\r\n\
@@ -142,7 +154,7 @@ fn notify(srv: &Server, nts: &str) -> io::Result<()> {
              NTS: {nts}\r\n\
              SERVER: {SERVER_HEADER}\r\n\
              USN: {usn}\r\n\
-             BOOTID.UPNP.ORG: 1\r\n\
+             BOOTID.UPNP.ORG: {boot}\r\n\
              CONFIGID.UPNP.ORG: 1\r\n\r\n"
         );
         socket.send_to(msg.as_bytes(), target)?;

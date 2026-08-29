@@ -39,7 +39,9 @@ status page at `/` are the whole management interface.
 ## What it does
 
 - **Discovery.** Answers `M-SEARCH` probes and multicasts `ssdp:alive` every ten
-  minutes, withdrawing with `ssdp:byebye` on exit.
+  minutes, withdrawing with `ssdp:byebye` on exit. `BOOTID.UPNP.ORG` carries the
+  start time, so a TV can tell a restart from a server that never went away —
+  the UUID alone cannot say, being stable on purpose.
 - **Browsing.** `ContentDirectory:1` `Browse` over folders and files, with
   pagination. Folders holding no playable media are pruned from the tree.
 - **Streaming.** HTTP `Range` requests, including the suffix and open-ended
