@@ -11,7 +11,7 @@ use crate::{FNV_OFFSET, fnv1a};
 const MAX_DEPTH: u32 = 16;
 const ROOT: u32 = 0;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Folder,
     Video,
@@ -270,4 +270,131 @@ fn classify(path: &Path) -> Option<(Kind, &'static str)> {
         _ => return None,
     };
     Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, Library};
+    use crate::test_support::TempDir;
+
+    fn id_of(lib: &Library, title: &str) -> Option<u32> {
+        lib.items.values().find(|i| i.title == title).map(|i| i.id)
+    }
+
+    #[test]
+    fn a_scan_keeps_only_playable_files() {
+        let tmp = TempDir::new();
+        tmp.file("holiday.mp4", 1);
+        tmp.file("notes.txt", 1);
+        let lib = Library::scan(tmp.path(), "test", None);
+
+        assert_eq!(lib.files, 1);
+        assert_eq!(lib.folders, 0);
+        assert!(id_of(&lib, "holiday").is_some());
+        assert_eq!(id_of(&lib, "notes"), None);
+    }
+
+    #[test]
+    fn ids_carry_over_a_rescan() {
+        let tmp = TempDir::new();
+        tmp.file("a.mkv", 1);
+        tmp.file("b.mkv", 1);
+        let first = Library::scan(tmp.path(), "test", None);
+        let (a, b) = (id_of(&first, "a").unwrap(), id_of(&first, "b").unwrap());
+
+        tmp.file("c.mkv", 1);
+        let second = Library::scan(tmp.path(), "test", Some(&first));
+
+        assert_eq!(id_of(&second, "a"), Some(a));
+        assert_eq!(id_of(&second, "b"), Some(b));
+        let c = id_of(&second, "c").unwrap();
+        assert!(c != a && c != b, "a new file took an id already handed out");
+    }
+
+    /// The invariant a TV depends on: an id it cached before the rescan either
+    /// still resolves to the file it asked for, or to nothing at all.
+    #[test]
+    fn a_removed_file_never_passes_its_id_on() {
+        let tmp = TempDir::new();
+        tmp.file("gone.mkv", 1);
+        let first = Library::scan(tmp.path(), "test", None);
+        let gone = id_of(&first, "gone").unwrap();
+
+        tmp.remove("gone.mkv");
+        tmp.file("fresh.mkv", 1);
+        let second = Library::scan(tmp.path(), "test", Some(&first));
+
+        assert_eq!(second.get(gone).map(|i| i.id), None);
+        assert_ne!(id_of(&second, "fresh"), Some(gone));
+    }
+
+    #[test]
+    fn folders_without_playable_content_are_pruned() {
+        let tmp = TempDir::new();
+        tmp.file("papers/thesis.txt", 1);
+        tmp.file("clips/holiday.mp4", 1);
+        let lib = Library::scan(tmp.path(), "test", None);
+
+        assert_eq!(id_of(&lib, "papers"), None);
+        assert!(id_of(&lib, "clips").is_some());
+        assert_eq!(lib.folders, 1);
+        assert_eq!(lib.files, 1);
+    }
+
+    /// `add_folder` claims an id before it walks, so a folder that was empty at
+    /// the first scan keeps that id once it earns a place in the tree.
+    #[test]
+    fn a_pruned_folder_keeps_its_id_when_it_gains_content() {
+        let tmp = TempDir::new();
+        tmp.file("later/thesis.txt", 1);
+        let first = Library::scan(tmp.path(), "test", None);
+        assert_eq!(id_of(&first, "later"), None);
+        let claimed = first.assigned[&tmp.path().join("later")];
+
+        tmp.file("later/holiday.mp4", 1);
+        let second = Library::scan(tmp.path(), "test", Some(&first));
+        assert_eq!(id_of(&second, "later"), Some(claimed));
+    }
+
+    #[test]
+    fn an_unchanged_tree_keeps_its_fingerprint() {
+        let tmp = TempDir::new();
+        tmp.file("a.mkv", 10);
+        let first = Library::scan(tmp.path(), "test", None);
+        let again = Library::scan(tmp.path(), "test", Some(&first));
+        assert_eq!(first.fingerprint, again.fingerprint);
+
+        tmp.file("a.mkv", 20);
+        let resized = Library::scan(tmp.path(), "test", Some(&first));
+        assert_ne!(resized.fingerprint, first.fingerprint);
+
+        tmp.file("b.mkv", 1);
+        let grown = Library::scan(tmp.path(), "test", Some(&resized));
+        assert_ne!(grown.fingerprint, resized.fingerprint);
+    }
+
+    #[test]
+    fn a_sidecar_srt_rides_along_without_becoming_an_item() {
+        let tmp = TempDir::new();
+        tmp.file("film.mkv", 1);
+        tmp.file("film.srt", 1);
+        tmp.file("silent.mkv", 1);
+        let lib = Library::scan(tmp.path(), "test", None);
+
+        let film = lib.get(id_of(&lib, "film").unwrap()).unwrap();
+        assert_eq!(film.kind, Kind::Video);
+        assert!(film.subtitle.is_some());
+        assert!(lib.get(id_of(&lib, "silent").unwrap()).unwrap().subtitle.is_none());
+        assert_eq!(lib.files, 2, "the .srt should not be browsable itself");
+    }
+
+    #[test]
+    fn dotfiles_are_skipped() {
+        let tmp = TempDir::new();
+        tmp.file(".hidden.mp4", 1);
+        tmp.file("shown.mp4", 1);
+        let lib = Library::scan(tmp.path(), "test", None);
+        assert_eq!(lib.files, 1);
+        assert!(id_of(&lib, "shown").is_some());
+    }
 }

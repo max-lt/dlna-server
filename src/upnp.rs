@@ -413,7 +413,44 @@ pub fn stable_uuid(seed: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, stable_uuid, tag};
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, RwLock};
+
+    use super::{browse, escape, stable_uuid, tag};
+    use crate::Server;
+    use crate::library::Library;
+    use crate::test_support::TempDir;
+
+    fn server_over(tmp: &TempDir) -> Server {
+        Server {
+            uuid: stable_uuid("test"),
+            name: "Test".to_string(),
+            ip: Ipv4Addr::LOCALHOST,
+            port: 8200,
+            root: tmp.path().to_path_buf(),
+            lib: RwLock::new(Arc::new(Library::scan(tmp.path(), "Test", None))),
+            update_id: AtomicU32::new(1),
+        }
+    }
+
+    /// A root holding `clip0.mp4` .. `clip4.mp4`.
+    fn five_clips() -> (TempDir, Server) {
+        let tmp = TempDir::new();
+        for n in 0..5 {
+            tmp.file(&format!("clip{n}.mp4"), 1);
+        }
+        let srv = server_over(&tmp);
+        (tmp, srv)
+    }
+
+    fn request(object_id: u32, flag: &str, start: usize, count: usize) -> String {
+        format!(
+            "<u:Browse><ObjectID>{object_id}</ObjectID><BrowseFlag>{flag}</BrowseFlag>\
+             <Filter>*</Filter><StartingIndex>{start}</StartingIndex>\
+             <RequestedCount>{count}</RequestedCount><SortCriteria></SortCriteria></u:Browse>"
+        )
+    }
 
     #[test]
     fn tag_ignores_namespace_prefixes() {
@@ -442,5 +479,69 @@ mod tests {
         assert_ne!(uuid, stable_uuid("Rust DLNA|/Users/max/Films"));
         assert_eq!(uuid.len(), 36);
         assert_eq!(uuid.as_bytes()[14], b'4');
+    }
+
+    #[test]
+    fn browse_pages_through_a_container() {
+        let (_tmp, srv) = five_clips();
+        let (status, page) = browse(&srv, &request(0, "BrowseDirectChildren", 1, 2));
+
+        assert_eq!(status, 200);
+        assert!(page.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(page.contains("<TotalMatches>5</TotalMatches>"));
+    }
+
+    #[test]
+    fn a_requested_count_of_zero_means_everything_left() {
+        let (_tmp, srv) = five_clips();
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 3, 0));
+
+        assert!(page.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(page.contains("<TotalMatches>5</TotalMatches>"));
+    }
+
+    #[test]
+    fn a_start_past_the_end_still_reports_the_total() {
+        let (_tmp, srv) = five_clips();
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 99, 10));
+
+        assert!(page.contains("<NumberReturned>0</NumberReturned>"));
+        assert!(page.contains("<TotalMatches>5</TotalMatches>"));
+    }
+
+    #[test]
+    fn browse_metadata_returns_the_object_itself() {
+        let (_tmp, srv) = five_clips();
+        let (status, page) = browse(&srv, &request(0, "BrowseMetadata", 0, 0));
+
+        assert_eq!(status, 200);
+        assert!(page.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(page.contains("<TotalMatches>1</TotalMatches>"));
+        // The ContentDirectory spec has the root report a parent of -1; the DIDL
+        // is escaped into <Result>, so its attribute quotes arrive as entities.
+        assert!(page.contains("parentID=&quot;-1&quot;"));
+    }
+
+    #[test]
+    fn browsing_an_object_that_does_not_exist_faults() {
+        let (_tmp, srv) = five_clips();
+        let (status, body) = browse(&srv, &request(9999, "BrowseDirectChildren", 0, 0));
+
+        assert_eq!(status, 500);
+        assert!(body.contains("<errorCode>701</errorCode>"));
+    }
+
+    #[test]
+    fn a_video_with_a_sidecar_offers_the_subtitle_twice() {
+        let tmp = TempDir::new();
+        tmp.file("film.mkv", 1);
+        tmp.file("film.srt", 1);
+        let srv = server_over(&tmp);
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
+
+        // Once as sec:CaptionInfoEx, which LG and Samsung read, and once as a
+        // second <res> for everything else.
+        assert!(page.contains("sec:CaptionInfoEx"));
+        assert_eq!(page.matches("/sub/").count(), 2);
     }
 }

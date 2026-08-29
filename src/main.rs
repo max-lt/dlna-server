@@ -255,3 +255,52 @@ OPTIONS:
 
 A rescan can also be triggered on demand at http://<addr>:<port>/rescan.
 ";
+
+/// A scratch directory that clears itself up, so the scan can be tested against
+/// real trees without a crate to build them.
+#[cfg(test)]
+pub mod test_support {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub struct TempDir(PathBuf);
+
+    #[allow(clippy::new_without_default)]
+    impl TempDir {
+        pub fn new() -> TempDir {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "dlna-server-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create scratch directory");
+            // The scan records paths verbatim, and `/var` is a symlink on macOS.
+            TempDir(path.canonicalize().expect("canonicalise scratch directory"))
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+
+        pub fn file(&self, relative: &str, size: usize) -> PathBuf {
+            let path = self.0.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent folder");
+            }
+            fs::write(&path, vec![0u8; size]).expect("write file");
+            path
+        }
+
+        pub fn remove(&self, relative: &str) {
+            fs::remove_file(self.0.join(relative)).expect("remove file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
