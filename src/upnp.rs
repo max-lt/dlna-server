@@ -2,8 +2,8 @@
 
 use crate::Server;
 use crate::library::{Item, Kind};
-use crate::thumbs;
 use crate::{FNV_OFFSET, fnv1a};
+use crate::{thumbs, transcode};
 
 /// `DLNA.ORG_OP=01` advertises byte-seek support, which is what makes a TV's
 /// scrub bar work; the flags word marks the resource as streamable.
@@ -308,15 +308,28 @@ fn render(srv: &Server, item: &Item) -> String {
     }
 
     // The media first: a TV plays the first <res> it can, and a JPEG counts.
+    // A converted file stands in for the original rather than beside it:
+    // given both, an LG set went for the original and played it mute.
     // Some renderers sniff the URL extension before reading the MIME type.
-    let ext = item.path.extension().map_or_else(String::new, |ext| {
-        format!(".{}", ext.to_string_lossy().to_lowercase())
-    });
+    let (mime, size, url) = match srv.transcoder().and_then(|t| t.ready(item)) {
+        Some(converted) => (
+            transcode::MIME,
+            std::fs::metadata(&converted).map_or(0, |m| m.len()),
+            format!("{base}/transcode/{}.{}", item.id, transcode::EXTENSION),
+        ),
+        None => {
+            let ext = item.path.extension().map_or_else(String::new, |ext| {
+                format!(".{}", ext.to_string_lossy().to_lowercase())
+            });
+            (
+                item.mime,
+                item.size,
+                format!("{base}/media/{}{ext}", item.id),
+            )
+        }
+    };
     out.push_str(&format!(
-        r#"<res protocolInfo="http-get:*:{mime}:{RES_FLAGS}" size="{size}">{base}/media/{id}{ext}</res>"#,
-        mime = item.mime,
-        size = item.size,
-        id = item.id,
+        r#"<res protocolInfo="http-get:*:{mime}:{RES_FLAGS}" size="{size}">{url}</res>"#
     ));
     if item.subtitle.is_some() {
         out.push_str(&format!(
@@ -597,6 +610,39 @@ mod tests {
             .map(|marker| page.find(marker).expect(marker))
             .collect();
         assert!(res[0] < res[1] && res[1] < res[2], "{res:?}");
+    }
+
+    /// Runs only where ffmpeg is installed: once converted, a DTS clip is
+    /// offered as the converted file, with its real size, and not as it is.
+    #[test]
+    fn a_dts_clip_is_offered_converted_only() {
+        let tmp = TempDir::new();
+        if crate::test_support::dts_clip(tmp.path()).is_none() {
+            eprintln!("no ffmpeg in PATH, skipping");
+            return;
+        }
+        let mut config = Config::new("Test", tmp.path().to_path_buf());
+        config.transcode = Some(tmp.path().join("cache"));
+        let srv = Server::build(config, Ipv4Addr::LOCALHOST, 8200);
+        let transcoder = srv.transcoder().expect("ffmpeg is there");
+        let (_, before) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
+        assert!(
+            before.contains("/media/1.mkv"),
+            "the original, until converted"
+        );
+
+        transcoder.work(&srv.library(), &|| false, &|_| {});
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
+        assert!(page.contains("/transcode/1.mkv"));
+        assert!(
+            !page.contains("/media/1.mkv"),
+            "the original would be picked and play mute"
+        );
+        assert!(page.contains("DLNA.ORG_OP=01"));
+        assert!(
+            !page.contains("size=&quot;0&quot;"),
+            "the converted file's own size"
+        );
     }
 
     #[test]

@@ -5,15 +5,15 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::Server;
 use crate::library::Kind;
-use crate::{thumbs, upnp};
+use crate::{Event, Server};
+use crate::{thumbs, transcode, upnp};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// Generous: a paused renderer can sit on a stalled socket for a while.
@@ -34,6 +34,7 @@ enum Body {
 
 enum Resource {
     Media,
+    Converted,
     Subtitle,
     Thumbnail,
 }
@@ -100,6 +101,12 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
     stream.set_nodelay(true)?;
 
     let req = read_request(&stream)?;
+    srv.notify(Event::Request {
+        peer: peer(&stream),
+        method: &req.method,
+        path: &req.path,
+        range: req.header("Range"),
+    });
     let body = if req.method == "HEAD" {
         Body::Omit
     } else {
@@ -164,11 +171,16 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
             let slug = &p["/thumb/".len()..];
             serve_object(&mut stream, &req, srv, slug, Resource::Thumbnail, body)
         }
+        ("GET" | "HEAD", p) if p.starts_with("/transcode/") => {
+            let slug = &p["/transcode/".len()..];
+            serve_object(&mut stream, &req, srv, slug, Resource::Converted, body)
+        }
         _ => send(&mut stream, 404, TEXT, &[], b"not found\n", body),
     }
 }
 
-/// Serves `/media/<id>.<ext>`, or the subtitle or thumbnail of the same object.
+/// Serves `/media/<id>.<ext>`, or the converted, subtitle or thumbnail file of
+/// the same object.
 fn serve_object(
     stream: &mut TcpStream,
     req: &Request,
@@ -192,6 +204,25 @@ fn serve_object(
             "Streaming",
             upnp::RES_FLAGS.to_string(),
         ),
+        Resource::Converted => match srv.transcoder().and_then(|t| t.ready(item)) {
+            Some(converted) => (
+                converted,
+                transcode::MIME,
+                "Streaming",
+                upnp::RES_FLAGS.to_string(),
+            ),
+            None => {
+                return send(
+                    stream,
+                    404,
+                    TEXT,
+                    &[],
+                    b"not converted
+",
+                    body,
+                );
+            }
+        },
         Resource::Subtitle => match &item.subtitle {
             Some(subtitle) => (
                 subtitle.clone(),
@@ -215,7 +246,24 @@ fn serve_object(
         ("transferMode.dlna.org", mode),
         ("contentFeatures.dlna.org", features.as_str()),
     ];
+    // One line per start: a seek comes as a fresh request with a range.
+    let from_the_top = req.header("Range").is_none_or(|r| r.trim() == "bytes=0-");
+    let playing = matches!(resource, Resource::Media | Resource::Converted);
+    if playing && body == Body::Send && from_the_top {
+        srv.notify(Event::Streaming {
+            peer: peer(stream),
+            item,
+            converted: matches!(resource, Resource::Converted),
+            from: Duration::ZERO,
+        });
+    }
     serve_file(stream, req, &path, mime, &dlna, body)
+}
+
+fn peer(stream: &TcpStream) -> IpAddr {
+    stream
+        .peer_addr()
+        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip())
 }
 
 fn serve_file(

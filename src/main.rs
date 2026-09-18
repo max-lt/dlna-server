@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use dlna_server::{Config, DEFAULT_PORT, Server, net};
+use dlna_server::{Config, DEFAULT_PORT, Event, Server, net};
 
 /// Long enough that the stat sweep stays invisible, short enough that a file
 /// dropped in shows up before you reach for the remote.
@@ -43,11 +43,43 @@ fn run(options: Options) -> io::Result<()> {
     config.port = options.port;
     config.rescan_every = options.watch;
     config.thumbnails = options.thumbnails;
-    config.on_change = Some(Box::new(|lib| {
-        println!(
-            "library changed: {} folders, {} files",
-            lib.folders, lib.files
-        );
+    config.transcode = options.transcode.clone();
+    let verbose = options.verbose;
+    config.on_event = Some(Box::new(move |event| match event {
+        Event::Request {
+            peer,
+            method,
+            path,
+            range,
+        } => {
+            if verbose {
+                let range = range.map_or(String::new(), |r| format!("  [{r}]"));
+                println!("{peer} {method} {path}{range}");
+            }
+        }
+        Event::Converted(item) => {
+            println!("audio converted, plays with sound now: {}", item.title);
+        }
+        Event::LibraryChanged(lib) => {
+            println!(
+                "library changed: {} folders, {} files",
+                lib.folders, lib.files
+            );
+        }
+        Event::Streaming {
+            peer,
+            item,
+            converted,
+            from,
+        } => {
+            let how = if converted { " (audio converted)" } else { "" };
+            let from = if from.is_zero() {
+                String::new()
+            } else {
+                format!(" from {}", clock(from))
+            };
+            println!("{peer} plays {}{how}{from}", item.title);
+        }
     }));
     let srv = Server::start(config)?;
 
@@ -67,13 +99,11 @@ fn run(options: Options) -> io::Result<()> {
         Some(interval) => println!("rescanning every {}s", interval.as_secs()),
         None => println!("rescan on demand at {}/rescan", srv.base_url()),
     }
-    match srv.thumbnails() {
-        None => println!("thumbnails: off"),
-        Some(thumbs) if thumbs.ffmpeg_found() => println!(
-            "thumbnails: a .jpg next to the video, else a frame by ffmpeg, cached in {}",
-            thumbs.cache_dir().display()
-        ),
-        Some(_) => println!("thumbnails: a .jpg next to the video only, no ffmpeg in PATH"),
+    if srv.thumbnails().is_some_and(|t| !t.ffmpeg_found()) {
+        eprintln!("warning: no ffmpeg in PATH, only a .jpg next to a video shows as its thumbnail");
+    }
+    if options.transcode.is_some() && srv.transcoder().is_none() {
+        eprintln!("warning: no ffmpeg and ffprobe in PATH, a DTS or TrueHD track plays mute");
     }
     println!("announcing over SSDP; pick it up from the TV's media player");
     let lans: Vec<net::Interface> = interfaces.into_iter().filter(|i| !i.vm).collect();
@@ -90,6 +120,16 @@ fn run(options: Options) -> io::Result<()> {
     println!("\nshutting down, withdrawing announcements");
     srv.shutdown();
     Ok(())
+}
+
+fn clock(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!(
+        "{}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 extern "C" fn on_signal(_signal: i32) {
@@ -136,6 +176,8 @@ struct Options {
     ip: Option<Ipv4Addr>,
     watch: Option<Duration>,
     thumbnails: Option<PathBuf>,
+    transcode: Option<PathBuf>,
+    verbose: bool,
 }
 
 impl Options {
@@ -149,7 +191,10 @@ impl Options {
         let mut watch = Some(DEFAULT_WATCH);
         // Generated frames go under the system temp directory, never next to
         // the videos.
-        let mut thumbnails = Some(std::env::temp_dir().join("dlna-server"));
+        let cache = std::env::temp_dir().join("dlna-server");
+        let mut thumbnails = Some(cache.clone());
+        let mut transcode = Some(cache);
+        let mut verbose = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -180,6 +225,8 @@ impl Options {
                     );
                 }
                 "--no-thumbs" => thumbnails = None,
+                "--no-transcode" => transcode = None,
+                "-v" | "--verbose" => verbose = true,
                 other if other.starts_with('-') => return Err(format!("unknown option {other}")),
                 other if dir.is_none() => dir = Some(PathBuf::from(other)),
                 other => return Err(format!("unexpected argument {other}")),
@@ -203,6 +250,8 @@ impl Options {
             ip,
             watch,
             thumbnails,
+            transcode,
+            verbose,
         }))
     }
 }
@@ -224,6 +273,10 @@ OPTIONS:
         --list           List the interfaces --ip can pick, then exit
         --no-thumbs      Serve no thumbnails (default: a .jpg next to the
                          video, else a frame pulled by ffmpeg when installed)
+        --no-transcode   Serve every file as it is (default: a file whose audio
+                         a TV cannot decode, DTS and the like, is converted to
+                         AC-3 in the background; the video is never touched)
+    -v, --verbose        Print every HTTP request, to watch what a TV does
     -h, --help           Print this help
 
 A rescan can also be triggered on demand at http://<addr>:<port>/rescan.

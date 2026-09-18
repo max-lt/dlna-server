@@ -5,7 +5,8 @@ A DLNA (UPnP AV) media server. Point it at a folder, browse it from the TV.
 No dependencies, `std` alone. SSDP discovery, the ContentDirectory SOAP service
 and HTTP range streaming are all implemented here, which is why the release
 binary is small and links nothing but libSystem. The one outside program it
-uses is `ffmpeg`, when installed, to pull thumbnails.
+uses is `ffmpeg`, when installed, to pull thumbnails and to convert audio a
+TV cannot decode.
 
 The crate is a library with a command line on top; see "As a library" for
 embedding it in something else.
@@ -32,6 +33,10 @@ OPTIONS:
         --list           List the interfaces --ip can pick, then exit
         --no-thumbs      Serve no thumbnails (default: a .jpg next to the
                          video, else a frame pulled by ffmpeg when installed)
+        --no-transcode   Serve every file as it is (default: a file whose audio
+                         a TV cannot decode, DTS and the like, is converted to
+                         AC-3 in the background; the video is never touched)
+    -v, --verbose        Print every HTTP request, to watch what a TV does
     -h, --help           Print this help
 ```
 
@@ -62,14 +67,22 @@ status page at `/` are the whole management interface.
   directory; nothing is ever written next to the videos. Either way the item
   carries a `upnp:albumArtURI` and a `JPEG_MED` `<res>`, which is what a TV's
   grid reads. Frames are made on first request, one `ffmpeg` at a time.
-- **Change detection.** A timer rescans the tree and swaps the library only when
-  a fingerprint over paths, sizes and mtimes moves. Object ids survive a rescan,
-  so an id a TV cached still resolves to the file it asked for, and
-  `SystemUpdateID` advances to tell a control point to browse again.
+- **Audio conversion.** Most sets have no decoder for DTS, TrueHD, Opus or
+  Vorbis and play such a file mute. With `ffmpeg` and `ffprobe` in `PATH`,
+  every video is probed on a background thread, and one whose audio is on
+  that list is converted there and then: the video and subtitles copied, the
+  track re-encoded to AC-3, into a complete Matroska file under the system
+  temp directory. A 7 GB film takes about twenty seconds on an SSD. Once it
+  is there the item offers the converted file in place of the original, with
+  its real size and byte ranges, exactly like any other file, and
+  `SystemUpdateID` moves so the TV browses again. Until then the original is
+  offered as it is. A stream converted on the fly was tried first and does
+  not work: a TV probes a file by byte offsets before it plays, and nothing
+  but a real file answers those.
 
-There is no transcoding: the renderer gets the original bytes. That covers most
-containers an LG set will meet, but an exotic codec fails to play rather than
-being converted.
+The video is never transcoded: the renderer gets the original picture bytes.
+A codec it cannot decode fails to play rather than being converted; only the
+audio tracks listed above are.
 
 ## Layout
 
@@ -82,22 +95,29 @@ being converted.
 | `src/upnp.rs` | device description, SCPDs, SOAP and DIDL-Lite |
 | `src/library.rs` | filesystem scan into numeric UPnP object IDs |
 | `src/thumbs.rs` | thumbnails: the poster sidecar, the `ffmpeg` frame, the cache |
+| `src/transcode.rs` | audio conversion: the `ffprobe` pass, the `ffmpeg` run, the cache |
 | `src/net.rs` | route lookup, interface list, `SO_REUSEPORT` binding, signal handling |
 
 Thumbnails touch the rest of the code in three places: the `thumbnail` field
 on an item, the `albumArtURI` in the DIDL, and the `/thumb/` route. Setting
-`Config::thumbnails` to `None` turns all three off.
+`Config::thumbnails` to `None` turns all three off. Audio conversion likewise:
+the converting worker, the `<res>` in the DIDL, and the `/transcode/`
+route, all behind `Config::transcode`.
 
 ## As a library
 
 ```rust
-use dlna_server::{Config, Server};
+use dlna_server::{Config, Event, Server};
 
 let mut config = Config::new("Living Room", "/Users/max/Movies".into());
 config.rescan_every = Some(std::time::Duration::from_secs(30));
 config.thumbnails = Some(std::env::temp_dir().join("dlna-server"));
-config.on_change = Some(Box::new(|lib| {
-    println!("{} folders, {} files", lib.folders, lib.files);
+config.transcode = Some(std::env::temp_dir().join("dlna-server"));
+config.on_event = Some(Box::new(|event| match event {
+    Event::LibraryChanged(lib) => println!("{} files", lib.files),
+    Event::Streaming { peer, item, .. } => println!("{peer} plays {}", item.title),
+    Event::Converted(item) => println!("{} now plays with sound", item.title),
+    Event::Request { .. } => {}
 }));
 
 let srv = Server::start(config)?;
@@ -107,11 +127,11 @@ srv.shutdown();
 ```
 
 `start` binds the port, scans, and returns once discovery is running. `rescan`
-can be called at any time; `on_change` fires from whichever thread found the
-change, the timer's or the caller's. `shutdown` withdraws the SSDP
-announcement and joins every worker, so a new `start` on the same port
-succeeds straight after. Errors on the way go to stderr; nothing is written
-to stdout.
+can be called at any time. `on_event` fires from whichever thread has the
+news: the timer's or the caller's for a library change, an HTTP thread for a
+renderer starting to read. `shutdown` withdraws the SSDP announcement and
+joins every worker, so a new `start` on the same port succeeds straight
+after. Errors on the way go to stderr; nothing is written to stdout.
 
 ## Notes
 
@@ -126,6 +146,11 @@ more than one interface is up the banner lists them, the active one marked;
 and container tools create (`bridgeNNN` on macOS; `docker0`, `br-*`, `virbr0`,
 `vmnet*` on Linux) are told by name, never picked and left out of the banner;
 `--list` still shows them, marked.
+
+A converted file is as big as the original and lives in the temp directory,
+which the system clears in its own time; a replaced original gets a fresh
+conversion, keyed on path, size and mtime. `shutdown` kills a conversion
+under way and leaves no half-written file behind.
 
 A generated thumbnail is keyed on the video's path, size and mtime, so a
 replaced file gets a fresh one; the old file stays in the temp directory until

@@ -7,30 +7,57 @@
 pub mod library;
 pub mod net;
 pub mod thumbs;
+pub mod transcode;
 
 mod http;
 mod ssdp;
 mod upnp;
 
 use std::io;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use library::Library;
+use library::{Item, Library};
 use thumbs::Thumbnails;
+use transcode::Transcoder;
 
 pub const DEFAULT_PORT: u16 = 8200;
 /// How long a blocked worker takes to notice a shutdown.
 const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+/// How long a new video waits before its audio is probed.
+const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
-/// Called after every rescan that changed the library.
-pub type OnChange = Box<dyn Fn(&Library) + Send + Sync>;
+/// What the server reports as it runs. Errors go to stderr; this is the rest.
+pub enum Event<'a> {
+    /// A rescan swapped the library in.
+    LibraryChanged(&'a Library),
+    /// A file with audio the TV cannot decode now has a converted twin.
+    Converted(&'a Item),
+    /// Every HTTP request, as it comes in. Chatty; for watching what a TV does.
+    Request {
+        peer: IpAddr,
+        method: &'a str,
+        path: &'a str,
+        /// The `Range` header, the one that tells what a renderer is up to.
+        range: Option<&'a str>,
+    },
+    /// A renderer started reading a video or a track, `from` the position it
+    /// asked for; `converted` when the audio is re-encoded on the way.
+    Streaming {
+        peer: IpAddr,
+        item: &'a Item,
+        converted: bool,
+        from: Duration,
+    },
+}
+
+pub type OnEvent = Box<dyn Fn(Event) + Send + Sync>;
 
 /// What to serve and how to reach it.
 pub struct Config {
@@ -46,11 +73,15 @@ pub struct Config {
     pub rescan_every: Option<Duration>,
     /// Where generated thumbnails are cached; `None` turns thumbnails off.
     pub thumbnails: Option<PathBuf>,
-    pub on_change: Option<OnChange>,
+    /// Where converted files go; `None` leaves audio the TV cannot decode
+    /// as it is.
+    pub transcode: Option<PathBuf>,
+    pub on_event: Option<OnEvent>,
 }
 
 impl Config {
-    /// The default port, no timer, no thumbnails, an autodetected address.
+    /// The default port, an autodetected address, no timer, no thumbnails,
+    /// no transcoding.
     pub fn new(name: impl Into<String>, root: PathBuf) -> Config {
         Config {
             name: name.into(),
@@ -59,7 +90,8 @@ impl Config {
             port: DEFAULT_PORT,
             rescan_every: None,
             thumbnails: None,
-            on_change: None,
+            transcode: None,
+            on_event: None,
         }
     }
 }
@@ -73,7 +105,8 @@ pub struct Server {
     lib: RwLock<Arc<Library>>,
     update_id: AtomicU32,
     thumbs: Option<Thumbnails>,
-    on_change: Option<OnChange>,
+    transcoder: Option<Transcoder>,
+    on_event: Option<OnEvent>,
     stopping: AtomicBool,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -100,6 +133,22 @@ impl Server {
                 }
             }));
         }
+        if srv.transcoder.is_some() {
+            let worker = Arc::clone(&srv);
+            workers.push(thread::spawn(move || {
+                loop {
+                    let transcoder = worker.transcoder.as_ref().expect("checked above");
+                    transcoder.work(&worker.library(), &|| worker.stopping(), &|item| {
+                        // The TV browses again once SystemUpdateID moves.
+                        worker.update_id.fetch_add(1, Ordering::Relaxed);
+                        worker.notify(Event::Converted(item));
+                    });
+                    if !worker.sleep(PROBE_INTERVAL) {
+                        break;
+                    }
+                }
+            }));
+        }
         *srv.workers.lock().unwrap() = workers;
         Ok(srv)
     }
@@ -116,7 +165,8 @@ impl Server {
             lib: RwLock::new(Arc::new(library)),
             update_id: AtomicU32::new(1),
             thumbs: config.thumbnails.map(Thumbnails::new),
-            on_change: config.on_change,
+            transcoder: config.transcode.and_then(Transcoder::new),
+            on_event: config.on_event,
             stopping: AtomicBool::new(false),
             workers: Mutex::new(Vec::new()),
         }
@@ -136,9 +186,7 @@ impl Server {
         let fresh = Arc::new(fresh);
         *self.lib.write().unwrap() = Arc::clone(&fresh);
         self.update_id.fetch_add(1, Ordering::Relaxed);
-        if let Some(on_change) = &self.on_change {
-            on_change(&fresh);
-        }
+        self.notify(Event::LibraryChanged(&fresh));
         (fresh, true)
     }
 
@@ -156,10 +204,18 @@ impl Server {
         self.thumbs.as_ref()
     }
 
+    /// `None` when transcoding is off, or ffmpeg is not installed.
+    pub fn transcoder(&self) -> Option<&Transcoder> {
+        self.transcoder.as_ref()
+    }
+
     /// Withdraws the announcement and stops every worker. The handle is inert
     /// afterwards; start a new one to serve again.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        if let Some(transcoder) = &self.transcoder {
+            transcoder.abort();
+        }
         // The accept loop only looks at the flag once a connection arrives.
         let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
         let workers = std::mem::take(&mut *self.workers.lock().unwrap());
@@ -167,6 +223,12 @@ impl Server {
             let _ = worker.join();
         }
         ssdp::byebye(self);
+    }
+
+    pub(crate) fn notify(&self, event: Event) {
+        if let Some(on_event) = &self.on_event {
+            on_event(event);
+        }
     }
 
     pub(crate) fn stopping(&self) -> bool {
@@ -187,7 +249,20 @@ impl Server {
     }
 }
 
-/// FNV-1a, for the device UUID, the library fingerprint and the thumbnail cache.
+/// Path, size and mtime of an item's file: a replaced file gets a fresh
+/// thumbnail and a fresh conversion.
+pub(crate) fn cache_key(item: &Item) -> u64 {
+    let modified = std::fs::metadata(&item.path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let key = fnv1a(FNV_OFFSET, item.path.to_string_lossy().as_bytes());
+    let key = fnv1a(key, &item.size.to_le_bytes());
+    fnv1a(key, &modified.to_le_bytes())
+}
+
+/// FNV-1a, for the device UUID, the library fingerprint and the caches.
 pub(crate) fn fnv1a(seed: u64, data: &[u8]) -> u64 {
     let mut hash = seed;
     for &byte in data {
@@ -272,6 +347,20 @@ pub mod test_support {
         pub fn remove(&self, relative: &str) {
             fs::remove_file(self.0.join(relative)).expect("remove file");
         }
+    }
+
+    /// A two-second clip with a DTS track, where ffmpeg is installed.
+    pub fn dts_clip(dir: &Path) -> Option<PathBuf> {
+        let clip = dir.join("clip.mkv");
+        // The DTS encoder is marked experimental, hence -strict -2.
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=2:size=64x64:rate=10")
+            .args(["-f", "lavfi", "-i", "sine=duration=2"])
+            .args(["-c:v", "mpeg4", "-c:a", "dca", "-strict", "-2"])
+            .arg(&clip)
+            .status();
+        made.is_ok_and(|s| s.success()).then_some(clip)
     }
 
     impl Drop for TempDir {

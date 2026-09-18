@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use crate::cache_key;
 use crate::library::{Item, Kind};
-use crate::{FNV_OFFSET, fnv1a};
 
 /// 1024x768 at most: sharp on a 4K set's grid, and a few tens of KB on a LAN.
 /// `JPEG_TN`, the 160x160 profile, is the fallback should a renderer refuse it.
@@ -90,18 +90,6 @@ pub fn sidecar(video: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Path, size and mtime: a replaced file gets a fresh thumbnail.
-fn cache_key(item: &Item) -> u64 {
-    let modified = fs::metadata(&item.path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
-    let key = fnv1a(FNV_OFFSET, item.path.to_string_lossy().as_bytes());
-    let key = fnv1a(key, &item.size.to_le_bytes());
-    fnv1a(key, &modified.to_le_bytes())
 }
 
 fn extract_frame(video: &Path, target: &Path) -> bool {
