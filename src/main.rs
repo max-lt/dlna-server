@@ -6,6 +6,7 @@ mod net;
 mod ssdp;
 mod upnp;
 
+use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -93,10 +94,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(options: Options) -> std::io::Result<()> {
+fn run(options: Options) -> io::Result<()> {
+    let interfaces = net::interfaces()?;
     let ip = match options.ip {
         Some(ip) => ip,
-        None => net::local_ipv4()?,
+        None => pick_ip(&interfaces)?,
     };
 
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, options.port))?;
@@ -136,6 +138,11 @@ fn run(options: Options) -> std::io::Result<()> {
         None => println!("rescan on demand at {}/rescan", srv.base_url()),
     }
     println!("announcing over SSDP; pick it up from the TV's media player");
+    let lans: Vec<net::Interface> = interfaces.into_iter().filter(|i| !i.vm).collect();
+    if options.ip.is_none() && lans.len() > 1 {
+        println!("several interfaces are up; if the TV is on another one, pass --ip <ADDR>:");
+        print!("{}", interface_table(&lans, Some(ip), "(active)"));
+    }
 
     net::on_terminate(on_signal);
     while !SHUTDOWN.load(Ordering::Relaxed) {
@@ -145,6 +152,58 @@ fn run(options: Options) -> std::io::Result<()> {
     println!("\nshutting down, withdrawing announcements");
     ssdp::byebye(&srv);
     Ok(())
+}
+
+/// Without `--ip`: the default route's address when it sits on a LAN, else the
+/// first LAN. A VPN as default route is not where the TV is, nor is a VM bridge.
+fn pick_ip(interfaces: &[net::Interface]) -> io::Result<Ipv4Addr> {
+    pick(net::local_ipv4(), interfaces)
+}
+
+fn pick(route: io::Result<Ipv4Addr>, interfaces: &[net::Interface]) -> io::Result<Ipv4Addr> {
+    let lans: Vec<&net::Interface> = interfaces.iter().filter(|i| !i.vm).collect();
+    match (route, lans.first()) {
+        (Ok(ip), _) if lans.iter().any(|i| i.addr == ip) => Ok(ip),
+        (_, Some(lan)) => Ok(lan.addr),
+        (route, None) => route.map_err(|err| {
+            io::Error::other(format!(
+                "no LAN interface is up and no default route ({err}); pass --ip"
+            ))
+        }),
+    }
+}
+
+/// `--list`: every interface up, the one the server would pick on its own
+/// marked, and the VM bridges it never picks marked too.
+fn list_interfaces() -> Result<(), String> {
+    let interfaces = net::interfaces().map_err(|err| format!("listing interfaces: {err}"))?;
+    if interfaces.is_empty() {
+        return Err("no LAN interface is up".to_string());
+    }
+    let picked = pick_ip(&interfaces).ok();
+    print!("{}", interface_table(&interfaces, picked, "(default)"));
+    Ok(())
+}
+
+/// One interface per line, columns aligned, `label` on the marked address and
+/// `(vm bridge)` on the ones the server never picks.
+fn interface_table(interfaces: &[net::Interface], marked: Option<Ipv4Addr>, label: &str) -> String {
+    let width = interfaces.iter().map(|i| i.name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for i in interfaces {
+        let cidr = format!("{}/{}", i.addr, i.prefix);
+        let mark = if marked == Some(i.addr) {
+            label
+        } else if i.vm {
+            "(vm bridge)"
+        } else {
+            ""
+        };
+        let line = format!("    {:width$}  {cidr:18} {mark}", i.name);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// Rescans on a timer, so files added or removed reach the TV without a restart.
@@ -176,7 +235,8 @@ struct Options {
 }
 
 impl Options {
-    /// `Ok(None)` means `--help` was handled and there is nothing left to do.
+    /// `Ok(None)` means `--help` or `--list` was handled and there is nothing
+    /// left to do.
     fn parse() -> Result<Option<Options>, String> {
         let mut dir = None;
         let mut name = None;
@@ -192,6 +252,7 @@ impl Options {
                     print!("{USAGE}");
                     return Ok(None);
                 }
+                "--list" => return list_interfaces().map(|()| None),
                 "-p" | "--port" => {
                     port = value("--port")?
                         .parse()
@@ -251,10 +312,88 @@ OPTIONS:
     -n, --name <NAME>    Name shown on the TV (default: \"Rust DLNA\")
     -w, --watch <SECS>   Rescan interval, 0 to disable (default: 30)
         --ip <ADDR>      LAN address to advertise (default: autodetected)
+        --list           List the interfaces --ip can pick, then exit
     -h, --help           Print this help
 
 A rescan can also be triggered on demand at http://<addr>:<port>/rescan.
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net::Interface;
+
+    fn lan(name: &str, addr: [u8; 4]) -> Interface {
+        Interface {
+            name: name.into(),
+            addr: addr.into(),
+            prefix: 24,
+            vm: false,
+        }
+    }
+
+    fn vm(name: &str, addr: [u8; 4]) -> Interface {
+        Interface {
+            vm: true,
+            ..lan(name, addr)
+        }
+    }
+
+    fn no_route() -> io::Result<Ipv4Addr> {
+        Err(io::Error::other("Network is unreachable"))
+    }
+
+    #[test]
+    fn default_route_wins_when_it_is_a_lan() {
+        let lans = [
+            lan("en0", [192, 168, 1, 69]),
+            lan("en7", [192, 168, 8, 103]),
+        ];
+        assert_eq!(pick(Ok(lans[1].addr), &lans).unwrap(), lans[1].addr);
+    }
+
+    #[test]
+    fn tunnel_or_missing_default_route_yields_to_the_first_lan() {
+        let lans = [lan("en7", [192, 168, 8, 103])];
+        assert_eq!(pick(Ok([10, 8, 0, 2].into()), &lans).unwrap(), lans[0].addr);
+        assert_eq!(pick(no_route(), &lans).unwrap(), lans[0].addr);
+    }
+
+    #[test]
+    fn vm_bridges_are_never_picked_over_a_lan() {
+        let ifs = [
+            vm("bridge100", [192, 168, 139, 3]),
+            lan("en7", [192, 168, 8, 103]),
+        ];
+        assert_eq!(pick(Ok(ifs[0].addr), &ifs).unwrap(), ifs[1].addr);
+        assert_eq!(pick(no_route(), &ifs).unwrap(), ifs[1].addr);
+        // With no LAN at all, the route is still the only address to try.
+        assert_eq!(pick(Ok(ifs[0].addr), &ifs[..1]).unwrap(), ifs[0].addr);
+        assert!(pick(no_route(), &ifs[..1]).is_err());
+    }
+
+    #[test]
+    fn no_lan_falls_back_to_the_route_or_fails() {
+        let tunnel = Ipv4Addr::new(10, 8, 0, 2);
+        assert_eq!(pick(Ok(tunnel), &[]).unwrap(), tunnel);
+        assert!(pick(no_route(), &[]).is_err());
+    }
+
+    #[test]
+    fn table_aligns_columns_and_marks_active_and_vm() {
+        let ifs = [
+            lan("en0", [192, 168, 1, 69]),
+            vm("bridge100", [192, 168, 139, 3]),
+            lan("en7", [192, 168, 8, 103]),
+        ];
+        assert_eq!(
+            interface_table(&ifs, Some(ifs[0].addr), "(active)"),
+            "    en0        192.168.1.69/24    (active)\n\
+             \x20   bridge100  192.168.139.3/24   (vm bridge)\n\
+             \x20   en7        192.168.8.103/24\n"
+        );
+    }
+}
 
 /// A scratch directory that clears itself up, so the scan can be tested against
 /// real trees without a crate to build them.

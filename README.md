@@ -25,6 +25,7 @@ OPTIONS:
     -n, --name <NAME>    Name shown on the TV (default: "Rust DLNA")
     -w, --watch <SECS>   Rescan interval, 0 to disable (default: 30)
         --ip <ADDR>      LAN address to advertise (default: autodetected)
+        --list           List the interfaces --ip can pick, then exit
     -h, --help           Print this help
 ```
 
@@ -66,7 +67,7 @@ being converted.
 | `src/http.rs` | HTTP/1.1 server, routing, range streaming |
 | `src/upnp.rs` | device description, SCPDs, SOAP and DIDL-Lite |
 | `src/library.rs` | filesystem scan into numeric UPnP object IDs |
-| `src/net.rs` | route lookup, `SO_REUSEPORT` binding, signal handling |
+| `src/net.rs` | route lookup, interface list, `SO_REUSEPORT` binding, signal handling |
 
 ## Notes
 
@@ -74,8 +75,13 @@ macOS asks to allow incoming connections on first run. Denying it is the usual
 reason a DLNA server stays invisible to the TV: the daemon runs fine and answers
 nothing.
 
-The advertised address is taken from the default route. With a VM bridge or a
-VPN in play, pass `--ip` to pin the interface the TV is actually on.
+The advertised address is the default route's, as long as that is a LAN and
+not a VPN tunnel. A TV on another network never sees the announcement, so when
+more than one interface is up the banner lists them, the active one marked;
+`--list` shows them all, and `--ip` pins the one the TV is on. The bridges VM
+and container tools create (`bridgeNNN` on macOS; `docker0`, `br-*`, `virbr0`,
+`vmnet*` on Linux) are told by name, never picked and left out of the banner;
+`--list` still shows them, marked.
 
 Change detection is a `stat` sweep, not FSEvents: no `unsafe` FFI, and it works
 the same on Linux. The sweep is served from the VFS cache in the normal case,
