@@ -6,14 +6,14 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::Server;
 use crate::library::Kind;
-use crate::upnp;
+use crate::{thumbs, upnp};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// Generous: a paused renderer can sit on a stalled socket for a while.
@@ -35,6 +35,7 @@ enum Body {
 enum Resource {
     Media,
     Subtitle,
+    Thumbnail,
 }
 
 /// A client's `Range` header resolved against the size of the file.
@@ -60,9 +61,16 @@ impl Request {
     }
 }
 
-pub fn serve(listener: TcpListener, srv: Arc<Server>) {
+pub fn serve(listener: TcpListener, srv: Arc<Server>) -> JoinHandle<()> {
     thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for stream in listener.incoming() {
+            // `shutdown` connects once so that this is looked at.
+            if srv.stopping() {
+                break;
+            }
+            let Ok(stream) = stream else {
+                continue;
+            };
             let srv = Arc::clone(&srv);
             thread::spawn(move || {
                 let peer = stream
@@ -83,7 +91,7 @@ pub fn serve(listener: TcpListener, srv: Arc<Server>) {
                 }
             });
         }
-    });
+    })
 }
 
 fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
@@ -142,7 +150,6 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
             let (lib, changed) = srv.rescan();
             let state = if changed { "updated" } else { "unchanged" };
             let report = format!("{state}: {} folders, {} files\n", lib.folders, lib.files);
-            print!("rescan: {report}");
             send(&mut stream, 200, TEXT, &[], report.as_bytes(), body)
         }
         ("GET" | "HEAD", p) if p.starts_with("/media/") => {
@@ -153,11 +160,15 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
             let slug = &p["/sub/".len()..];
             serve_object(&mut stream, &req, srv, slug, Resource::Subtitle, body)
         }
+        ("GET" | "HEAD", p) if p.starts_with("/thumb/") => {
+            let slug = &p["/thumb/".len()..];
+            serve_object(&mut stream, &req, srv, slug, Resource::Thumbnail, body)
+        }
         _ => send(&mut stream, 404, TEXT, &[], b"not found\n", body),
     }
 }
 
-/// Serves `/media/<id>.<ext>` or the sidecar subtitle of the same object.
+/// Serves `/media/<id>.<ext>`, or the subtitle or thumbnail of the same object.
 fn serve_object(
     stream: &mut TcpStream,
     req: &Request,
@@ -174,18 +185,37 @@ fn serve_object(
         return send(stream, 404, TEXT, &[], b"no such object\n", body);
     };
 
-    let (path, mime, mode): (&Path, &str, &str) = match resource {
-        Resource::Media => (&item.path, item.mime, "Streaming"),
+    let (path, mime, mode, features): (PathBuf, &str, &str, String) = match resource {
+        Resource::Media => (
+            item.path.clone(),
+            item.mime,
+            "Streaming",
+            upnp::RES_FLAGS.to_string(),
+        ),
         Resource::Subtitle => match &item.subtitle {
-            Some(subtitle) => (subtitle, "text/srt", "Background"),
+            Some(subtitle) => (
+                subtitle.clone(),
+                "text/srt",
+                "Background",
+                upnp::RES_FLAGS.to_string(),
+            ),
             None => return send(stream, 404, TEXT, &[], b"no subtitle\n", body),
+        },
+        Resource::Thumbnail => match srv.thumbnails().and_then(|t| t.fetch(item)) {
+            Some(jpeg) => (
+                jpeg,
+                "image/jpeg",
+                "Interactive",
+                format!("DLNA.ORG_PN={}", thumbs::PROFILE),
+            ),
+            None => return send(stream, 404, TEXT, &[], b"no thumbnail\n", body),
         },
     };
     let dlna = [
         ("transferMode.dlna.org", mode),
-        ("contentFeatures.dlna.org", upnp::RES_FLAGS),
+        ("contentFeatures.dlna.org", features.as_str()),
     ];
-    serve_file(stream, req, path, mime, &dlna, body)
+    serve_file(stream, req, &path, mime, &dlna, body)
 }
 
 fn serve_file(

@@ -15,6 +15,25 @@ pub fn local_ipv4() -> io::Result<Ipv4Addr> {
     }
 }
 
+/// Without `--ip`: the default route's address when it sits on a LAN, else the
+/// first LAN. A VPN as default route is not where the TV is, nor is a VM bridge.
+pub fn pick_ip(interfaces: &[Interface]) -> io::Result<Ipv4Addr> {
+    pick(local_ipv4(), interfaces)
+}
+
+fn pick(route: io::Result<Ipv4Addr>, interfaces: &[Interface]) -> io::Result<Ipv4Addr> {
+    let lans: Vec<&Interface> = interfaces.iter().filter(|i| !i.vm).collect();
+    match (route, lans.first()) {
+        (Ok(ip), _) if lans.iter().any(|i| i.addr == ip) => Ok(ip),
+        (_, Some(lan)) => Ok(lan.addr),
+        (route, None) => route.map_err(|err| {
+            io::Error::other(format!(
+                "no LAN interface is up and no default route ({err}); pass --ip"
+            ))
+        }),
+    }
+}
+
 /// An interface a renderer could sit behind: up, running and broadcast-capable,
 /// which leaves out loopback and tunnels.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +243,67 @@ mod sys {
         pub fn signal(sig: i32, handler: usize) -> usize;
         pub fn getifaddrs(head: *mut *mut IfAddrs) -> i32;
         pub fn freeifaddrs(head: *mut IfAddrs);
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    fn lan(name: &str, addr: [u8; 4]) -> Interface {
+        Interface {
+            name: name.into(),
+            addr: addr.into(),
+            prefix: 24,
+            vm: false,
+        }
+    }
+
+    fn vm(name: &str, addr: [u8; 4]) -> Interface {
+        Interface {
+            vm: true,
+            ..lan(name, addr)
+        }
+    }
+
+    fn no_route() -> io::Result<Ipv4Addr> {
+        Err(io::Error::other("Network is unreachable"))
+    }
+
+    #[test]
+    fn default_route_wins_when_it_is_a_lan() {
+        let lans = [
+            lan("en0", [192, 168, 1, 69]),
+            lan("en7", [192, 168, 8, 103]),
+        ];
+        assert_eq!(pick(Ok(lans[1].addr), &lans).unwrap(), lans[1].addr);
+    }
+
+    #[test]
+    fn tunnel_or_missing_default_route_yields_to_the_first_lan() {
+        let lans = [lan("en7", [192, 168, 8, 103])];
+        assert_eq!(pick(Ok([10, 8, 0, 2].into()), &lans).unwrap(), lans[0].addr);
+        assert_eq!(pick(no_route(), &lans).unwrap(), lans[0].addr);
+    }
+
+    #[test]
+    fn vm_bridges_are_never_picked_over_a_lan() {
+        let ifs = [
+            vm("bridge100", [192, 168, 139, 3]),
+            lan("en7", [192, 168, 8, 103]),
+        ];
+        assert_eq!(pick(Ok(ifs[0].addr), &ifs).unwrap(), ifs[1].addr);
+        assert_eq!(pick(no_route(), &ifs).unwrap(), ifs[1].addr);
+        // With no LAN at all, the route is still the only address to try.
+        assert_eq!(pick(Ok(ifs[0].addr), &ifs[..1]).unwrap(), ifs[0].addr);
+        assert!(pick(no_route(), &ifs[..1]).is_err());
+    }
+
+    #[test]
+    fn no_lan_falls_back_to_the_route_or_fails() {
+        let tunnel = Ipv4Addr::new(10, 8, 0, 2);
+        assert_eq!(pick(Ok(tunnel), &[]).unwrap(), tunnel);
+        assert!(pick(no_route(), &[]).is_err());
     }
 }
 

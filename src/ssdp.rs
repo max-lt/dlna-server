@@ -4,12 +4,12 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, LazyLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::Server;
 use crate::net;
 use crate::upnp::SERVER_HEADER;
+use crate::{SHUTDOWN_POLL, Server};
 
 const MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const PORT: u16 = 1900;
@@ -49,19 +49,21 @@ fn identities(uuid: &str) -> Vec<(String, String)> {
 }
 
 /// Starts the responder and the announcer, each on its own thread.
-pub fn start(srv: Arc<Server>) -> io::Result<()> {
+pub fn start(srv: Arc<Server>) -> io::Result<Vec<JoinHandle<()>>> {
     let socket = net::bind_reuse_udp(Ipv4Addr::UNSPECIFIED, PORT)?;
     socket.join_multicast_v4(&MULTICAST, &srv.ip)?;
+    // Or a shutdown would wait for the next probe to come in.
+    socket.set_read_timeout(Some(SHUTDOWN_POLL))?;
 
-    let responder = Arc::clone(&srv);
     let listen = socket.try_clone()?;
-    thread::spawn(move || {
-        if let Err(err) = respond(&listen, &responder) {
+    let responding = Arc::clone(&srv);
+    let responder = thread::spawn(move || {
+        if let Err(err) = respond(&listen, &responding) {
             eprintln!("ssdp: responder stopped: {err}");
         }
     });
 
-    thread::spawn(move || {
+    let announcer = thread::spawn(move || {
         loop {
             // Three copies: SSDP is unreliable by design and TVs miss packets.
             for _ in 0..3 {
@@ -71,10 +73,12 @@ pub fn start(srv: Arc<Server>) -> io::Result<()> {
                 }
                 thread::sleep(Duration::from_millis(200));
             }
-            thread::sleep(REANNOUNCE);
+            if !srv.sleep(REANNOUNCE) {
+                break;
+            }
         }
     });
-    Ok(())
+    Ok(vec![responder, announcer])
 }
 
 /// Withdraws our advertisements, so renderers drop us instead of waiting out
@@ -89,7 +93,21 @@ fn respond(socket: &UdpSocket, srv: &Server) -> io::Result<()> {
     let boot = *BOOT_ID;
     let mut buf = [0u8; 2048];
     loop {
-        let (len, from) = socket.recv_from(&mut buf)?;
+        if srv.stopping() {
+            return Ok(());
+        }
+        let (len, from) = match socket.recv_from(&mut buf) {
+            Ok(received) => received,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let msg = String::from_utf8_lossy(&buf[..len]);
         if !msg.starts_with("M-SEARCH") {
             continue;

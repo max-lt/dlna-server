@@ -2,6 +2,7 @@
 
 use crate::Server;
 use crate::library::{Item, Kind};
+use crate::thumbs;
 use crate::{FNV_OFFSET, fnv1a};
 
 /// `DLNA.ORG_OP=01` advertises byte-seek support, which is what makes a TV's
@@ -288,18 +289,25 @@ fn render(srv: &Server, item: &Item) -> String {
     );
     out.push_str(&format!("<upnp:class>{class}</upnp:class>"));
 
+    let thumbnail = srv
+        .thumbnails()
+        .filter(|t| t.offered(item))
+        .map(|_| format!("{base}/thumb/{}.jpg", item.id));
+    if let Some(url) = &thumbnail {
+        out.push_str(&format!(
+            r#"<upnp:albumArtURI dlna:profileID="{}">{url}</upnp:albumArtURI>"#,
+            thumbs::PROFILE
+        ));
+    }
     if item.subtitle.is_some() {
         // Samsung's extension, which LG's webOS player also honours.
         out.push_str(&format!(
             r#"<sec:CaptionInfoEx sec:type="srt">{base}/sub/{id}.srt</sec:CaptionInfoEx>"#,
             id = item.id
         ));
-        out.push_str(&format!(
-            r#"<res protocolInfo="http-get:*:text/srt:*">{base}/sub/{id}.srt</res>"#,
-            id = item.id
-        ));
     }
 
+    // The media first: a TV plays the first <res> it can, and a JPEG counts.
     // Some renderers sniff the URL extension before reading the MIME type.
     let ext = item.path.extension().map_or_else(String::new, |ext| {
         format!(".{}", ext.to_string_lossy().to_lowercase())
@@ -310,6 +318,18 @@ fn render(srv: &Server, item: &Item) -> String {
         size = item.size,
         id = item.id,
     ));
+    if item.subtitle.is_some() {
+        out.push_str(&format!(
+            r#"<res protocolInfo="http-get:*:text/srt:*">{base}/sub/{id}.srt</res>"#,
+            id = item.id
+        ));
+    }
+    if let Some(url) = &thumbnail {
+        out.push_str(&format!(
+            r#"<res protocolInfo="http-get:*:image/jpeg:DLNA.ORG_PN={}">{url}</res>"#,
+            thumbs::PROFILE
+        ));
+    }
     out.push_str("</item>");
     out
 }
@@ -328,11 +348,17 @@ fn protocol_info(srv: &Server) -> String {
     if mimes.is_empty() {
         mimes.push("video/mp4");
     }
-    mimes
+    let mut entries: Vec<String> = mimes
         .iter()
         .map(|m| format!("http-get:*:{m}:{RES_FLAGS}"))
-        .collect::<Vec<_>>()
-        .join(",")
+        .collect();
+    if srv.thumbnails().is_some() {
+        entries.push(format!(
+            "http-get:*:image/jpeg:DLNA.ORG_PN={}",
+            thumbs::PROFILE
+        ));
+    }
+    entries.join(",")
 }
 
 fn envelope(service: &str, action: &str, payload: &str) -> String {
@@ -414,24 +440,17 @@ pub fn stable_uuid(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
-    use std::sync::atomic::AtomicU32;
-    use std::sync::{Arc, RwLock};
 
     use super::{browse, escape, stable_uuid, tag};
-    use crate::Server;
-    use crate::library::Library;
     use crate::test_support::TempDir;
+    use crate::{Config, Server};
 
     fn server_over(tmp: &TempDir) -> Server {
-        Server {
-            uuid: stable_uuid("test"),
-            name: "Test".to_string(),
-            ip: Ipv4Addr::LOCALHOST,
-            port: 8200,
-            root: tmp.path().to_path_buf(),
-            lib: RwLock::new(Arc::new(Library::scan(tmp.path(), "Test", None))),
-            update_id: AtomicU32::new(1),
-        }
+        Server::build(
+            Config::new("Test", tmp.path().to_path_buf()),
+            Ipv4Addr::LOCALHOST,
+            8200,
+        )
     }
 
     /// A root holding `clip0.mp4` .. `clip4.mp4`.
@@ -543,5 +562,52 @@ mod tests {
         // second <res> for everything else.
         assert!(page.contains("sec:CaptionInfoEx"));
         assert_eq!(page.matches("/sub/").count(), 2);
+    }
+
+    #[test]
+    fn a_poster_is_offered_as_album_art_and_as_a_res() {
+        let tmp = TempDir::new();
+        tmp.file("film.mkv", 1);
+        tmp.file("film.jpg", 1);
+        let mut config = Config::new("Test", tmp.path().to_path_buf());
+        config.thumbnails = Some(tmp.path().join("cache"));
+        let srv = Server::build(config, Ipv4Addr::LOCALHOST, 8200);
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
+
+        assert!(page.contains("upnp:albumArtURI"));
+        assert_eq!(page.matches("/thumb/1.jpg").count(), 2);
+        assert!(page.contains("<TotalMatches>1</TotalMatches>"));
+    }
+
+    /// A TV plays the first <res> it can, and a JPEG counts: a thumbnail
+    /// listed first turned every film into a still on an LG set.
+    #[test]
+    fn the_video_is_the_first_res() {
+        let tmp = TempDir::new();
+        tmp.file("film.mkv", 1);
+        tmp.file("film.srt", 1);
+        tmp.file("film.jpg", 1);
+        let mut config = Config::new("Test", tmp.path().to_path_buf());
+        config.thumbnails = Some(tmp.path().join("cache"));
+        let srv = Server::build(config, Ipv4Addr::LOCALHOST, 8200);
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
+
+        let res: Vec<usize> = ["/media/", "/sub/1.srt&lt;/res", "/thumb/1.jpg&lt;/res"]
+            .iter()
+            .map(|marker| page.find(marker).expect(marker))
+            .collect();
+        assert!(res[0] < res[1] && res[1] < res[2], "{res:?}");
+    }
+
+    #[test]
+    fn thumbnails_off_leaves_the_didl_alone() {
+        let tmp = TempDir::new();
+        tmp.file("film.mkv", 1);
+        tmp.file("film.jpg", 1);
+        let srv = server_over(&tmp);
+        let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
+
+        assert!(!page.contains("albumArtURI"));
+        assert!(!page.contains("/thumb/"));
     }
 }

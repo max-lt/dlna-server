@@ -4,7 +4,11 @@ A DLNA (UPnP AV) media server. Point it at a folder, browse it from the TV.
 
 No dependencies, `std` alone. SSDP discovery, the ContentDirectory SOAP service
 and HTTP range streaming are all implemented here, which is why the release
-binary is 459 KB and links nothing but libSystem.
+binary is small and links nothing but libSystem. The one outside program it
+uses is `ffmpeg`, when installed, to pull thumbnails.
+
+The crate is a library with a command line on top; see "As a library" for
+embedding it in something else.
 
 ## Usage
 
@@ -26,6 +30,8 @@ OPTIONS:
     -w, --watch <SECS>   Rescan interval, 0 to disable (default: 30)
         --ip <ADDR>      LAN address to advertise (default: autodetected)
         --list           List the interfaces --ip can pick, then exit
+        --no-thumbs      Serve no thumbnails (default: a .jpg next to the
+                         video, else a frame pulled by ffmpeg when installed)
     -h, --help           Print this help
 ```
 
@@ -49,6 +55,13 @@ status page at `/` are the whole management interface.
   forms, so seeking and resume work. Files are streamed in 128 KB chunks.
 - **Subtitles.** A `.srt` next to a video is offered as a second `<res>` and via
   `sec:CaptionInfoEx`, which LG and Samsung sets read.
+- **Thumbnails.** A `.jpg` sharing the video's stem is its poster, as Kodi,
+  Plex and Jellyfin have it, and is not listed as a photo. Without one, and
+  with `ffmpeg` in `PATH`, a frame is pulled two minutes in (the first frame
+  of a shorter clip), scaled to fit 1024x768 and cached under the system temp
+  directory; nothing is ever written next to the videos. Either way the item
+  carries a `upnp:albumArtURI` and a `JPEG_MED` `<res>`, which is what a TV's
+  grid reads. Frames are made on first request, one `ffmpeg` at a time.
 - **Change detection.** A timer rescans the tree and swaps the library only when
   a fingerprint over paths, sizes and mtimes moves. Object ids survive a rescan,
   so an id a TV cached still resolves to the file it asked for, and
@@ -62,12 +75,43 @@ being converted.
 
 | File | Contents |
 | --- | --- |
-| `src/main.rs` | CLI, shared `Server` state, startup and shutdown |
+| `src/lib.rs` | `Config`, `Server`: start, rescan, shutdown |
+| `src/main.rs` | the command line: options, banner, Ctrl-C |
 | `src/ssdp.rs` | discovery: `M-SEARCH` replies and `NOTIFY` announcements |
 | `src/http.rs` | HTTP/1.1 server, routing, range streaming |
 | `src/upnp.rs` | device description, SCPDs, SOAP and DIDL-Lite |
 | `src/library.rs` | filesystem scan into numeric UPnP object IDs |
+| `src/thumbs.rs` | thumbnails: the poster sidecar, the `ffmpeg` frame, the cache |
 | `src/net.rs` | route lookup, interface list, `SO_REUSEPORT` binding, signal handling |
+
+Thumbnails touch the rest of the code in three places: the `thumbnail` field
+on an item, the `albumArtURI` in the DIDL, and the `/thumb/` route. Setting
+`Config::thumbnails` to `None` turns all three off.
+
+## As a library
+
+```rust
+use dlna_server::{Config, Server};
+
+let mut config = Config::new("Living Room", "/Users/max/Movies".into());
+config.rescan_every = Some(std::time::Duration::from_secs(30));
+config.thumbnails = Some(std::env::temp_dir().join("dlna-server"));
+config.on_change = Some(Box::new(|lib| {
+    println!("{} folders, {} files", lib.folders, lib.files);
+}));
+
+let srv = Server::start(config)?;
+println!("serving at {}", srv.base_url());
+// ... later, from any thread:
+srv.shutdown();
+```
+
+`start` binds the port, scans, and returns once discovery is running. `rescan`
+can be called at any time; `on_change` fires from whichever thread found the
+change, the timer's or the caller's. `shutdown` withdraws the SSDP
+announcement and joins every worker, so a new `start` on the same port
+succeeds straight after. Errors on the way go to stderr; nothing is written
+to stdout.
 
 ## Notes
 
@@ -82,6 +126,10 @@ more than one interface is up the banner lists them, the active one marked;
 and container tools create (`bridgeNNN` on macOS; `docker0`, `br-*`, `virbr0`,
 `vmnet*` on Linux) are told by name, never picked and left out of the banner;
 `--list` still shows them, marked.
+
+A generated thumbnail is keyed on the video's path, size and mtime, so a
+replaced file gets a fresh one; the old file stays in the temp directory until
+the system clears it.
 
 Change detection is a `stat` sweep, not FSEvents: no `unsafe` FFI, and it works
 the same on Linux. The sweep is served from the VFS cache in the normal case,

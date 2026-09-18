@@ -1,78 +1,20 @@
-//! A DLNA (UPnP AV) media server: point it at a folder, browse it from the TV.
-
-mod http;
-mod library;
-mod net;
-mod ssdp;
-mod upnp;
+//! The command line front end: options, the banner, Ctrl-C.
 
 use std::io;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use library::Library;
+use dlna_server::{Config, DEFAULT_PORT, Server, net};
 
-const DEFAULT_PORT: u16 = 8200;
 /// Long enough that the stat sweep stays invisible, short enough that a file
 /// dropped in shows up before you reach for the remote.
 const DEFAULT_WATCH: Duration = Duration::from_secs(30);
 
-pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-pub struct Server {
-    pub name: String,
-    pub uuid: String,
-    pub ip: Ipv4Addr,
-    pub port: u16,
-    pub root: PathBuf,
-    lib: RwLock<Arc<Library>>,
-    update_id: AtomicU32,
-}
-
-impl Server {
-    pub fn library(&self) -> Arc<Library> {
-        Arc::clone(&self.lib.read().unwrap())
-    }
-
-    /// Rescans, swapping the library in only if the tree actually changed.
-    pub fn rescan(&self) -> (Arc<Library>, bool) {
-        let current = self.library();
-        let fresh = Library::scan(&self.root, &self.name, Some(&current));
-        if fresh.fingerprint == current.fingerprint {
-            return (current, false);
-        }
-        let fresh = Arc::new(fresh);
-        *self.lib.write().unwrap() = Arc::clone(&fresh);
-        self.update_id.fetch_add(1, Ordering::Relaxed);
-        (fresh, true)
-    }
-
-    /// `SystemUpdateID`: a control point re-browses when this changes.
-    pub fn update_id(&self) -> u32 {
-        self.update_id.load(Ordering::Relaxed)
-    }
-
-    pub fn base_url(&self) -> String {
-        format!("http://{}:{}", self.ip, self.port)
-    }
-}
-
-/// FNV-1a, for the device UUID and the library fingerprint.
-pub fn fnv1a(seed: u64, data: &[u8]) -> u64 {
-    let mut hash = seed;
-    for &byte in data {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
 
 fn main() -> ExitCode {
     let options = match Options::parse() {
@@ -96,52 +38,48 @@ fn main() -> ExitCode {
 
 fn run(options: Options) -> io::Result<()> {
     let interfaces = net::interfaces()?;
-    let ip = match options.ip {
-        Some(ip) => ip,
-        None => pick_ip(&interfaces)?,
-    };
+    let mut config = Config::new(options.name, options.dir);
+    config.ip = options.ip;
+    config.port = options.port;
+    config.rescan_every = options.watch;
+    config.thumbnails = options.thumbnails;
+    config.on_change = Some(Box::new(|lib| {
+        println!(
+            "library changed: {} folders, {} files",
+            lib.folders, lib.files
+        );
+    }));
+    let srv = Server::start(config)?;
 
-    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, options.port))?;
-    let port = listener.local_addr()?.port();
-
-    let library = Library::scan(&options.dir, &options.name, None);
+    let lib = srv.library();
     println!(
         "{}: {} folders, {} files under {}",
-        options.name,
-        library.folders,
-        library.files,
-        options.dir.display()
+        srv.name,
+        lib.folders,
+        lib.files,
+        srv.root.display()
     );
-    if library.files == 0 {
+    if lib.files == 0 {
         eprintln!("warning: no playable media found, the server will look empty on the TV");
     }
-
-    let srv = Arc::new(Server {
-        uuid: upnp::stable_uuid(&format!("{}|{}", options.name, options.dir.display())),
-        name: options.name,
-        ip,
-        port,
-        root: options.dir,
-        lib: RwLock::new(Arc::new(library)),
-        update_id: AtomicU32::new(1),
-    });
-
-    http::serve(listener, Arc::clone(&srv));
-    ssdp::start(Arc::clone(&srv))?;
-    if let Some(interval) = options.watch {
-        watch_library(Arc::clone(&srv), interval);
-    }
-
     println!("listening on {}  (uuid:{})", srv.base_url(), srv.uuid);
     match options.watch {
         Some(interval) => println!("rescanning every {}s", interval.as_secs()),
         None => println!("rescan on demand at {}/rescan", srv.base_url()),
     }
+    match srv.thumbnails() {
+        None => println!("thumbnails: off"),
+        Some(thumbs) if thumbs.ffmpeg_found() => println!(
+            "thumbnails: a .jpg next to the video, else a frame by ffmpeg, cached in {}",
+            thumbs.cache_dir().display()
+        ),
+        Some(_) => println!("thumbnails: a .jpg next to the video only, no ffmpeg in PATH"),
+    }
     println!("announcing over SSDP; pick it up from the TV's media player");
     let lans: Vec<net::Interface> = interfaces.into_iter().filter(|i| !i.vm).collect();
     if options.ip.is_none() && lans.len() > 1 {
         println!("several interfaces are up; if the TV is on another one, pass --ip <ADDR>:");
-        print!("{}", interface_table(&lans, Some(ip), "(active)"));
+        print!("{}", interface_table(&lans, Some(srv.ip), "(active)"));
     }
 
     net::on_terminate(on_signal);
@@ -150,27 +88,12 @@ fn run(options: Options) -> io::Result<()> {
     }
 
     println!("\nshutting down, withdrawing announcements");
-    ssdp::byebye(&srv);
+    srv.shutdown();
     Ok(())
 }
 
-/// Without `--ip`: the default route's address when it sits on a LAN, else the
-/// first LAN. A VPN as default route is not where the TV is, nor is a VM bridge.
-fn pick_ip(interfaces: &[net::Interface]) -> io::Result<Ipv4Addr> {
-    pick(net::local_ipv4(), interfaces)
-}
-
-fn pick(route: io::Result<Ipv4Addr>, interfaces: &[net::Interface]) -> io::Result<Ipv4Addr> {
-    let lans: Vec<&net::Interface> = interfaces.iter().filter(|i| !i.vm).collect();
-    match (route, lans.first()) {
-        (Ok(ip), _) if lans.iter().any(|i| i.addr == ip) => Ok(ip),
-        (_, Some(lan)) => Ok(lan.addr),
-        (route, None) => route.map_err(|err| {
-            io::Error::other(format!(
-                "no LAN interface is up and no default route ({err}); pass --ip"
-            ))
-        }),
-    }
+extern "C" fn on_signal(_signal: i32) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
 }
 
 /// `--list`: every interface up, the one the server would pick on its own
@@ -180,7 +103,7 @@ fn list_interfaces() -> Result<(), String> {
     if interfaces.is_empty() {
         return Err("no LAN interface is up".to_string());
     }
-    let picked = pick_ip(&interfaces).ok();
+    let picked = net::pick_ip(&interfaces).ok();
     print!("{}", interface_table(&interfaces, picked, "(default)"));
     Ok(())
 }
@@ -206,32 +129,13 @@ fn interface_table(interfaces: &[net::Interface], marked: Option<Ipv4Addr>, labe
     out
 }
 
-/// Rescans on a timer, so files added or removed reach the TV without a restart.
-fn watch_library(srv: Arc<Server>, interval: Duration) {
-    thread::spawn(move || {
-        loop {
-            thread::sleep(interval);
-            let (lib, changed) = srv.rescan();
-            if changed {
-                println!(
-                    "library changed: {} folders, {} files",
-                    lib.folders, lib.files
-                );
-            }
-        }
-    });
-}
-
-extern "C" fn on_signal(_signal: i32) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
-}
-
 struct Options {
     dir: PathBuf,
     name: String,
     port: u16,
     ip: Option<Ipv4Addr>,
     watch: Option<Duration>,
+    thumbnails: Option<PathBuf>,
 }
 
 impl Options {
@@ -243,6 +147,9 @@ impl Options {
         let mut port = DEFAULT_PORT;
         let mut ip = None;
         let mut watch = Some(DEFAULT_WATCH);
+        // Generated frames go under the system temp directory, never next to
+        // the videos.
+        let mut thumbnails = Some(std::env::temp_dir().join("dlna-server"));
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -272,6 +179,7 @@ impl Options {
                             .map_err(|_| "--ip must be an IPv4 address".to_string())?,
                     );
                 }
+                "--no-thumbs" => thumbnails = None,
                 other if other.starts_with('-') => return Err(format!("unknown option {other}")),
                 other if dir.is_none() => dir = Some(PathBuf::from(other)),
                 other => return Err(format!("unexpected argument {other}")),
@@ -294,6 +202,7 @@ impl Options {
             port,
             ip,
             watch,
+            thumbnails,
         }))
     }
 }
@@ -313,6 +222,8 @@ OPTIONS:
     -w, --watch <SECS>   Rescan interval, 0 to disable (default: 30)
         --ip <ADDR>      LAN address to advertise (default: autodetected)
         --list           List the interfaces --ip can pick, then exit
+        --no-thumbs      Serve no thumbnails (default: a .jpg next to the
+                         video, else a frame pulled by ffmpeg when installed)
     -h, --help           Print this help
 
 A rescan can also be triggered on demand at http://<addr>:<port>/rescan.
@@ -332,58 +243,14 @@ mod tests {
         }
     }
 
-    fn vm(name: &str, addr: [u8; 4]) -> Interface {
-        Interface {
-            vm: true,
-            ..lan(name, addr)
-        }
-    }
-
-    fn no_route() -> io::Result<Ipv4Addr> {
-        Err(io::Error::other("Network is unreachable"))
-    }
-
-    #[test]
-    fn default_route_wins_when_it_is_a_lan() {
-        let lans = [
-            lan("en0", [192, 168, 1, 69]),
-            lan("en7", [192, 168, 8, 103]),
-        ];
-        assert_eq!(pick(Ok(lans[1].addr), &lans).unwrap(), lans[1].addr);
-    }
-
-    #[test]
-    fn tunnel_or_missing_default_route_yields_to_the_first_lan() {
-        let lans = [lan("en7", [192, 168, 8, 103])];
-        assert_eq!(pick(Ok([10, 8, 0, 2].into()), &lans).unwrap(), lans[0].addr);
-        assert_eq!(pick(no_route(), &lans).unwrap(), lans[0].addr);
-    }
-
-    #[test]
-    fn vm_bridges_are_never_picked_over_a_lan() {
-        let ifs = [
-            vm("bridge100", [192, 168, 139, 3]),
-            lan("en7", [192, 168, 8, 103]),
-        ];
-        assert_eq!(pick(Ok(ifs[0].addr), &ifs).unwrap(), ifs[1].addr);
-        assert_eq!(pick(no_route(), &ifs).unwrap(), ifs[1].addr);
-        // With no LAN at all, the route is still the only address to try.
-        assert_eq!(pick(Ok(ifs[0].addr), &ifs[..1]).unwrap(), ifs[0].addr);
-        assert!(pick(no_route(), &ifs[..1]).is_err());
-    }
-
-    #[test]
-    fn no_lan_falls_back_to_the_route_or_fails() {
-        let tunnel = Ipv4Addr::new(10, 8, 0, 2);
-        assert_eq!(pick(Ok(tunnel), &[]).unwrap(), tunnel);
-        assert!(pick(no_route(), &[]).is_err());
-    }
-
     #[test]
     fn table_aligns_columns_and_marks_active_and_vm() {
         let ifs = [
             lan("en0", [192, 168, 1, 69]),
-            vm("bridge100", [192, 168, 139, 3]),
+            Interface {
+                vm: true,
+                ..lan("bridge100", [192, 168, 139, 3])
+            },
             lan("en7", [192, 168, 8, 103]),
         ];
         assert_eq!(
@@ -392,54 +259,5 @@ mod tests {
              \x20   bridge100  192.168.139.3/24   (vm bridge)\n\
              \x20   en7        192.168.8.103/24\n"
         );
-    }
-}
-
-/// A scratch directory that clears itself up, so the scan can be tested against
-/// real trees without a crate to build them.
-#[cfg(test)]
-pub mod test_support {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    pub struct TempDir(PathBuf);
-
-    #[allow(clippy::new_without_default)]
-    impl TempDir {
-        pub fn new() -> TempDir {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "dlna-server-test-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).expect("create scratch directory");
-            // The scan records paths verbatim, and `/var` is a symlink on macOS.
-            TempDir(path.canonicalize().expect("canonicalise scratch directory"))
-        }
-
-        pub fn path(&self) -> &Path {
-            &self.0
-        }
-
-        pub fn file(&self, relative: &str, size: usize) -> PathBuf {
-            let path = self.0.join(relative);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).expect("create parent folder");
-            }
-            fs::write(&path, vec![0u8; size]).expect("write file");
-            path
-        }
-
-        pub fn remove(&self, relative: &str) {
-            fs::remove_file(self.0.join(relative)).expect("remove file");
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 }

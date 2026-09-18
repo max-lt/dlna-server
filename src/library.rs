@@ -1,10 +1,11 @@
 //! Filesystem scan: the media tree flattened into numeric UPnP object IDs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::thumbs;
 use crate::{FNV_OFFSET, fnv1a};
 
 /// Depth limit, so a pathological tree cannot run the scan away.
@@ -40,6 +41,8 @@ pub struct Item {
     pub mime: &'static str,
     /// Sidecar `.srt` sitting next to the video.
     pub subtitle: Option<PathBuf>,
+    /// Sidecar `.jpg` sitting next to the video, see [`thumbs`].
+    pub thumbnail: Option<PathBuf>,
     pub children: Vec<u32>,
 }
 
@@ -81,6 +84,7 @@ impl Library {
                 size: 0,
                 mime: "",
                 subtitle: None,
+                thumbnail: None,
                 children,
             },
         );
@@ -122,6 +126,13 @@ impl Library {
         }
         sorted.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
+        // A video's poster is its thumbnail, not a photo of its own.
+        let posters: HashSet<PathBuf> = sorted
+            .iter()
+            .filter(|(is_dir, _, path)| !is_dir && matches!(classify(path), Some((Kind::Video, _))))
+            .filter_map(|(_, _, path)| thumbs::sidecar(path))
+            .collect();
+
         let mut children = Vec::new();
         for (is_dir, _, path) in sorted {
             let name = path
@@ -135,6 +146,8 @@ impl Library {
                 if let Some(id) = self.add_folder(&path, parent, name, depth) {
                     children.push(id);
                 }
+            } else if posters.contains(&path) {
+                continue;
             } else if let Some((kind, mime)) = classify(&path) {
                 children.push(self.add_file(&path, parent, name, kind, mime));
             }
@@ -165,6 +178,7 @@ impl Library {
                 size: 0,
                 mime: "",
                 subtitle: None,
+                thumbnail: None,
                 children,
             },
         );
@@ -204,6 +218,11 @@ impl Library {
                 mime,
                 subtitle: if kind == Kind::Video {
                     find_subtitle(path)
+                } else {
+                    None
+                },
+                thumbnail: if kind == Kind::Video {
+                    thumbs::sidecar(path)
                 } else {
                     None
                 },
@@ -384,8 +403,30 @@ mod tests {
         let film = lib.get(id_of(&lib, "film").unwrap()).unwrap();
         assert_eq!(film.kind, Kind::Video);
         assert!(film.subtitle.is_some());
-        assert!(lib.get(id_of(&lib, "silent").unwrap()).unwrap().subtitle.is_none());
+        assert!(
+            lib.get(id_of(&lib, "silent").unwrap())
+                .unwrap()
+                .subtitle
+                .is_none()
+        );
         assert_eq!(lib.files, 2, "the .srt should not be browsable itself");
+    }
+
+    #[test]
+    fn a_sidecar_jpg_is_the_poster_not_a_photo() {
+        let tmp = TempDir::new();
+        tmp.file("film.mkv", 1);
+        let poster = tmp.file("film.jpg", 1);
+        tmp.file("holiday.jpg", 1);
+        let lib = Library::scan(tmp.path(), "test", None);
+
+        let film = lib.get(id_of(&lib, "film").unwrap()).unwrap();
+        assert_eq!(film.thumbnail, Some(poster));
+        assert_eq!(
+            lib.files, 2,
+            "the poster should not be browsable, the photo should"
+        );
+        assert!(id_of(&lib, "holiday").is_some());
     }
 
     #[test]
