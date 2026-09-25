@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::library::Kind;
 use crate::{Event, Server};
-use crate::{thumbs, transcode, upnp};
+use crate::{gena, thumbs, transcode, upnp};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// Generous: a paused renderer can sit on a stalled socket for a while.
@@ -146,12 +146,13 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
                 Body::Send,
             )
         }
-        // Eventing is advertised but carries nothing; the subscription only
-        // needs acknowledging.
-        ("SUBSCRIBE" | "UNSUBSCRIBE", p) if p.starts_with("/evt/") => {
-            let sid = format!("uuid:{}", srv.uuid);
-            let headers = [("SID", sid.as_str()), ("TIMEOUT", "Second-1800")];
-            send(&mut stream, 200, TEXT, &headers, b"", Body::Send)
+        ("SUBSCRIBE", p) if p.starts_with("/evt/") => subscribe(&mut stream, &req, srv, p),
+        ("UNSUBSCRIBE", p) if p.starts_with("/evt/") => {
+            let known = req
+                .header("SID")
+                .is_some_and(|sid| srv.events().unsubscribe(sid));
+            let status = if known { 200 } else { 412 };
+            send(&mut stream, status, TEXT, &[], b"", Body::Send)
         }
         ("GET" | "HEAD", "/rescan") => {
             let (lib, changed) = srv.rescan();
@@ -176,6 +177,41 @@ fn handle(mut stream: TcpStream, srv: &Server) -> io::Result<()> {
             serve_object(&mut stream, &req, srv, slug, Resource::Converted, body)
         }
         _ => send(&mut stream, 404, TEXT, &[], b"not found\n", body),
+    }
+}
+
+/// A new subscription (`CALLBACK` and `NT`) or a renewal (`SID`), per UPnP
+/// Device Architecture 1.0 §4.1. A new subscriber gets the initial event once
+/// the answer is out.
+fn subscribe(stream: &mut TcpStream, req: &Request, srv: &Server, path: &str) -> io::Result<()> {
+    let Some(service) = gena::Service::from_path(path) else {
+        return send(stream, 404, TEXT, &[], b"no such service\n", Body::Send);
+    };
+    let timeout = format!("Second-{}", gena::TIMEOUT.as_secs());
+    let callback = req.header("CALLBACK");
+    let nt = req.header("NT");
+    match (req.header("SID"), callback, nt) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            send(stream, 400, TEXT, &[], b"", Body::Send)
+        }
+        (Some(sid), None, None) => {
+            if !srv.events().renew(sid) {
+                return send(stream, 412, TEXT, &[], b"", Body::Send);
+            }
+            let headers = [("SID", sid), ("TIMEOUT", timeout.as_str())];
+            send(stream, 200, TEXT, &headers, b"", Body::Send)
+        }
+        (None, Some(callback), Some("upnp:event")) => {
+            let state = upnp::evented_state(srv, service);
+            let Some(initial) = srv.events().subscribe(service, callback, state) else {
+                return send(stream, 412, TEXT, &[], b"", Body::Send);
+            };
+            let headers = [("SID", initial.sid()), ("TIMEOUT", timeout.as_str())];
+            send(stream, 200, TEXT, &headers, b"", Body::Send)?;
+            initial.send();
+            Ok(())
+        }
+        _ => send(stream, 412, TEXT, &[], b"", Body::Send),
     }
 }
 
@@ -443,6 +479,7 @@ fn write_head(stream: &mut TcpStream, status: u16, headers: &[(&str, String)]) -
         206 => "Partial Content",
         400 => "Bad Request",
         404 => "Not Found",
+        412 => "Precondition Failed",
         416 => "Requested Range Not Satisfiable",
         500 => "Internal Server Error",
         _ => "OK",

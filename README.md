@@ -67,6 +67,12 @@ status page at `/` are the whole management interface.
   directory; nothing is ever written next to the videos. Either way the item
   carries a `upnp:albumArtURI` and a `JPEG_MED` `<res>`, which is what a TV's
   grid reads. Frames are made on first request, one `ffmpeg` at a time.
+- **Eventing.** GENA `SUBSCRIBE`, renewal and `UNSUBSCRIBE` on both
+  services, 1800 s per subscription. A new subscriber gets the initial event,
+  and every ContentDirectory subscriber gets a `NOTIFY` each time
+  `SystemUpdateID` moves, after a rescan or a conversion. A TV that has a
+  folder open browses it again then; without the event it keeps the URLs it
+  read first.
 - **Audio conversion.** Most sets have no decoder for DTS, TrueHD, Opus or
   Vorbis and play such a file mute. With `ffmpeg` and `ffprobe` in `PATH`,
   every video is probed on a background thread, and one whose audio is on
@@ -93,6 +99,7 @@ audio tracks listed above are.
 | `src/ssdp.rs` | discovery: `M-SEARCH` replies and `NOTIFY` announcements |
 | `src/http.rs` | HTTP/1.1 server, routing, range streaming |
 | `src/upnp.rs` | device description, SCPDs, SOAP and DIDL-Lite |
+| `src/gena.rs` | eventing: subscriptions and `NOTIFY` delivery |
 | `src/library.rs` | filesystem scan into numeric UPnP object IDs |
 | `src/thumbs.rs` | thumbnails: the poster sidecar, the `ffmpeg` frame, the cache |
 | `src/transcode.rs` | audio conversion: the `ffprobe` pass, the `ffmpeg` run, the cache |

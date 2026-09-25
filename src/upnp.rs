@@ -1,6 +1,7 @@
 //! UPnP/DLNA payloads: device description, SCPDs, and the SOAP control endpoints.
 
 use crate::Server;
+use crate::gena::{self, Service};
 use crate::library::{Item, Kind};
 use crate::{FNV_OFFSET, fnv1a};
 use crate::{thumbs, transcode};
@@ -160,6 +161,21 @@ pub const CM_SCPD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   </serviceStateTable>
 </scpd>
 "#;
+
+/// Every evented variable of `service`, for the initial event a new
+/// subscriber gets.
+pub fn evented_state(srv: &Server, service: Service) -> String {
+    match service {
+        Service::ContentDirectory => {
+            gena::propertyset(&[("SystemUpdateID", srv.update_id().to_string())])
+        }
+        Service::ConnectionManager => gena::propertyset(&[
+            ("SourceProtocolInfo", protocol_info(srv)),
+            ("SinkProtocolInfo", String::new()),
+            ("CurrentConnectionIDs", "0".to_string()),
+        ]),
+    }
+}
 
 /// Returns the HTTP status and body for one SOAP call.
 pub fn control(

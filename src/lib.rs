@@ -9,6 +9,7 @@ pub mod net;
 pub mod thumbs;
 pub mod transcode;
 
+mod gena;
 mod http;
 mod ssdp;
 mod upnp;
@@ -21,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use gena::{Service, Subscriptions};
 use library::{Item, Library};
 use thumbs::Thumbnails;
 use transcode::Transcoder;
@@ -104,6 +106,7 @@ pub struct Server {
     pub root: PathBuf,
     lib: RwLock<Arc<Library>>,
     update_id: AtomicU32,
+    events: Subscriptions,
     thumbs: Option<Thumbnails>,
     transcoder: Option<Transcoder>,
     on_event: Option<OnEvent>,
@@ -139,8 +142,7 @@ impl Server {
                 loop {
                     let transcoder = worker.transcoder.as_ref().expect("checked above");
                     transcoder.work(&worker.library(), &|| worker.stopping(), &|item| {
-                        // The TV browses again once SystemUpdateID moves.
-                        worker.update_id.fetch_add(1, Ordering::Relaxed);
+                        worker.changed();
                         worker.notify(Event::Converted(item));
                     });
                     if !worker.sleep(PROBE_INTERVAL) {
@@ -164,6 +166,7 @@ impl Server {
             root: config.root,
             lib: RwLock::new(Arc::new(library)),
             update_id: AtomicU32::new(1),
+            events: Subscriptions::new(),
             thumbs: config.thumbnails.map(Thumbnails::new),
             transcoder: config.transcode.and_then(Transcoder::new),
             on_event: config.on_event,
@@ -185,7 +188,7 @@ impl Server {
         }
         let fresh = Arc::new(fresh);
         *self.lib.write().unwrap() = Arc::clone(&fresh);
-        self.update_id.fetch_add(1, Ordering::Relaxed);
+        self.changed();
         self.notify(Event::LibraryChanged(&fresh));
         (fresh, true)
     }
@@ -193,6 +196,18 @@ impl Server {
     /// `SystemUpdateID`: a control point re-browses when this changes.
     pub fn update_id(&self) -> u32 {
         self.update_id.load(Ordering::Relaxed)
+    }
+
+    /// Moves SystemUpdateID and posts it to the ContentDirectory subscribers:
+    /// a TV browses again only once told.
+    pub(crate) fn changed(&self) {
+        let id = self.update_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let state = gena::propertyset(&[("SystemUpdateID", id.to_string())]);
+        self.events.publish(Service::ContentDirectory, &state);
+    }
+
+    pub(crate) fn events(&self) -> &Subscriptions {
+        &self.events
     }
 
     pub fn base_url(&self) -> String {
@@ -274,10 +289,60 @@ pub(crate) fn fnv1a(seed: u64, data: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, TcpStream};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
 
     use super::{Config, Server};
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, receive_notify};
+
+    /// A TV subscribed to ContentDirectory hears the new SystemUpdateID when
+    /// the library changes, and browses again.
+    #[test]
+    fn a_subscriber_is_told_when_the_library_changes() {
+        let tmp = TempDir::new();
+        tmp.file("one.mp4", 1);
+        let mut config = Config::new("Test", tmp.path().to_path_buf());
+        config.ip = Some(Ipv4Addr::LOCALHOST);
+        config.port = 0;
+        let srv = Server::start(config).expect("start");
+
+        let tv = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, srv.port)).unwrap();
+        write!(
+            stream,
+            "SUBSCRIBE /evt/cd HTTP/1.1\r\nHOST: 127.0.0.1\r\n\
+             CALLBACK: <http://{}/evt>\r\nNT: upnp:event\r\nTIMEOUT: Second-300\r\n\r\n",
+            tv.local_addr().unwrap()
+        )
+        .unwrap();
+        let answer: Vec<String> = BufReader::new(&stream)
+            .lines()
+            .map_while(Result::ok)
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert!(answer[0].contains(" 200 "), "{answer:?}");
+        assert!(
+            answer.iter().any(|h| h.starts_with("SID: uuid:")),
+            "{answer:?}"
+        );
+
+        let (seq, body) = receive_notify(&tv);
+        assert_eq!(seq, "0");
+        assert!(
+            body.contains("<SystemUpdateID>1</SystemUpdateID>"),
+            "{body}"
+        );
+
+        tmp.file("two.mp4", 1);
+        assert!(srv.rescan().1, "the library changed");
+        let (seq, body) = receive_notify(&tv);
+        assert_eq!(seq, "1");
+        assert!(
+            body.contains("<SystemUpdateID>2</SystemUpdateID>"),
+            "{body}"
+        );
+        srv.shutdown();
+    }
 
     #[test]
     fn shutdown_frees_the_port_for_the_next_start() {
@@ -312,6 +377,8 @@ mod tests {
 #[cfg(test)]
 pub mod test_support {
     use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -361,6 +428,33 @@ pub mod test_support {
             .arg(&clip)
             .status();
         made.is_ok_and(|s| s.success()).then_some(clip)
+    }
+
+    /// Reads one NOTIFY off `listener`, answers 200, and returns its SEQ
+    /// header and body.
+    pub fn receive_notify(listener: &TcpListener) -> (String, String) {
+        let (stream, _) = listener.accept().expect("a NOTIFY");
+        let mut reader = BufReader::new(&stream);
+        let mut seq = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("SEQ: ") {
+                seq = value.to_string();
+            }
+            if let Some(value) = line.strip_prefix("CONTENT-LENGTH: ") {
+                length = value.parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        (&stream).write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        (seq, String::from_utf8(body).unwrap())
     }
 
     impl Drop for TempDir {
