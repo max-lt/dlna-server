@@ -82,7 +82,8 @@ status page at `/` are the whole management interface.
   is there the item offers the converted file in place of the original, with
   its real size and byte ranges, exactly like any other file, and
   `SystemUpdateID` moves so the TV browses again. Until then the original is
-  offered as it is. A stream converted on the fly was tried first and does
+  offered as it is. A track title that names the old codec becomes `AC-3 5.1`
+  or the like, and the mkvmerge statistics tags of that track are dropped. A stream converted on the fly was tried first and does
   not work: a TV probes a file by byte offsets before it plays, and nothing
   but a real file answers those.
 

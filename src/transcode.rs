@@ -20,6 +20,19 @@ use crate::library::{Item, Kind, Library};
 const UNSUPPORTED: &[&str] = &["dts", "truehd", "mlp", "opus", "vorbis"];
 /// AC-3 tops out at 5.1 channels and 640 kb/s.
 const MAX_CHANNELS: u32 = 6;
+/// Words in a track title that name the codec it had before, lowercase.
+const OLD_CODEC_WORDS: &[&str] = &["dts", "truehd", "atmos", "master audio", "opus", "vorbis"];
+/// Statistics mkvmerge writes per track; they describe the old codec's
+/// stream, bitrate and size included, and go stale once it is re-encoded.
+const STALE_TAGS: &[&str] = &[
+    "BPS",
+    "DURATION",
+    "NUMBER_OF_FRAMES",
+    "NUMBER_OF_BYTES",
+    "_STATISTICS_WRITING_APP",
+    "_STATISTICS_WRITING_DATE_UTC",
+    "_STATISTICS_TAGS",
+];
 pub const MIME: &str = "video/x-matroska";
 pub const EXTENSION: &str = "mkv";
 
@@ -38,12 +51,21 @@ struct Probed {
     given_up: bool,
 }
 
-/// One audio track to convert: its index among the audio streams, and how
-/// many channels it has.
+/// One audio track to convert: its index among the audio streams, how many
+/// channels it has, and its title.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Track {
     index: usize,
     channels: u32,
+    title: Option<String>,
+}
+
+/// A probed audio stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Audio {
+    codec: String,
+    channels: u32,
+    title: Option<String>,
 }
 
 impl Transcoder {
@@ -164,6 +186,19 @@ impl Transcoder {
                     .arg(format!("-ac:a:{}", track.index))
                     .arg(MAX_CHANNELS.to_string());
             }
+            // An empty value removes the tag.
+            for tag in STALE_TAGS {
+                for key in [tag.to_string(), format!("{tag}-eng")] {
+                    command
+                        .arg(format!("-metadata:s:a:{}", track.index))
+                        .arg(format!("{key}="));
+                }
+            }
+            if let Some(title) = new_title(track) {
+                command
+                    .arg(format!("-metadata:s:a:{}", track.index))
+                    .arg(format!("title={title}"));
+            }
         }
         command
             .args(["-f", "matroska"])
@@ -226,7 +261,7 @@ fn probe(path: &Path) -> Option<String> {
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,codec_name,channels",
+            "stream=codec_type,codec_name,channels:stream_tags=title",
             "-of",
             "flat",
         ])
@@ -241,9 +276,9 @@ fn probe(path: &Path) -> Option<String> {
 }
 
 /// ffprobe's flat output, `streams.stream.N.codec_name="dts"` lines, into the
-/// audio tracks in order, as `(codec, channels)`.
-fn parse_probe(flat: &str) -> Vec<(String, u32)> {
-    let mut streams: HashMap<usize, (String, String, u32)> = HashMap::new();
+/// audio tracks in order.
+fn parse_probe(flat: &str) -> Vec<Audio> {
+    let mut streams: HashMap<usize, (String, Audio)> = HashMap::new();
     for line in flat.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -261,8 +296,9 @@ fn parse_probe(flat: &str) -> Vec<(String, u32)> {
         let stream = streams.entry(index).or_default();
         match field {
             "codec_type" => stream.0 = value.to_string(),
-            "codec_name" => stream.1 = value.to_string(),
-            "channels" => stream.2 = value.parse().unwrap_or(0),
+            "codec_name" => stream.1.codec = value.to_string(),
+            "channels" => stream.1.channels = value.parse().unwrap_or(0),
+            "tags.title" => stream.1.title = Some(value.to_string()),
             _ => {}
         }
     }
@@ -270,21 +306,38 @@ fn parse_probe(flat: &str) -> Vec<(String, u32)> {
     ordered.sort_by_key(|(index, _)| *index);
     ordered
         .into_iter()
-        .filter(|(_, (kind, _, _))| kind == "audio")
-        .map(|(_, (_, codec, channels))| (codec, channels))
+        .filter(|(_, (kind, _))| kind == "audio")
+        .map(|(_, (_, audio))| audio)
         .collect()
 }
 
-fn decide(audio: &[(String, u32)]) -> Vec<Track> {
+fn decide(audio: &[Audio]) -> Vec<Track> {
     audio
         .iter()
         .enumerate()
-        .filter(|(_, (codec, _))| UNSUPPORTED.contains(&codec.as_str()))
-        .map(|(index, (_, channels))| Track {
+        .filter(|(_, audio)| UNSUPPORTED.contains(&audio.codec.as_str()))
+        .map(|(index, audio)| Track {
             index,
-            channels: *channels,
+            channels: audio.channels,
+            title: audio.title.clone(),
         })
         .collect()
+}
+
+/// `AC-3 5.1` in place of a title that names the old codec, so the TV's track
+/// menu does not show DTS for an AC-3 track. `None` keeps the title as it is.
+fn new_title(track: &Track) -> Option<String> {
+    let title = track.title.as_deref()?.to_lowercase();
+    if !OLD_CODEC_WORDS.iter().any(|word| title.contains(word)) {
+        return None;
+    }
+    let layout = match track.channels.min(MAX_CHANNELS) {
+        1 => "1.0".to_string(),
+        2 => "2.0".to_string(),
+        6 => "5.1".to_string(),
+        n => format!("{n}ch"),
+    };
+    Some(format!("AC-3 {layout}"))
 }
 
 #[cfg(test)]
@@ -292,7 +345,7 @@ mod tests {
     use std::process::Command;
     use std::sync::Mutex;
 
-    use super::{Track, Transcoder, decide, parse_probe};
+    use super::{Audio, Track, Transcoder, decide, new_title, parse_probe};
     use crate::library::Library;
     use crate::test_support::{TempDir, dts_clip};
 
@@ -301,6 +354,7 @@ streams.stream.0.codec_type="video"
 streams.stream.1.codec_name="dts"
 streams.stream.1.codec_type="audio"
 streams.stream.1.channels=2
+streams.stream.1.tags.title="DTS 2.0"
 streams.stream.2.codec_name="hdmv_pgs_subtitle"
 streams.stream.2.codec_type="subtitle"
 format.duration="6530.483000"
@@ -308,13 +362,26 @@ format.duration="6530.483000"
 
     #[test]
     fn a_probe_yields_the_audio_tracks_in_order() {
-        assert_eq!(parse_probe(WAKE_IN_FRIGHT), vec![("dts".to_string(), 2)]);
+        assert_eq!(
+            parse_probe(WAKE_IN_FRIGHT),
+            vec![Audio {
+                codec: "dts".to_string(),
+                channels: 2,
+                title: Some("DTS 2.0".to_string()),
+            }]
+        );
     }
 
     #[test]
     fn only_the_tracks_the_tv_cannot_play_are_converted() {
-        let tracks = |list: &[(&str, u32)]| -> Vec<(String, u32)> {
-            list.iter().map(|(c, n)| (c.to_string(), *n)).collect()
+        let tracks = |list: &[(&str, u32)]| -> Vec<Audio> {
+            list.iter()
+                .map(|(c, n)| Audio {
+                    codec: c.to_string(),
+                    channels: *n,
+                    title: None,
+                })
+                .collect()
         };
         assert_eq!(decide(&tracks(&[("eac3", 6), ("aac", 2)])), vec![]);
         assert_eq!(
@@ -322,13 +389,41 @@ format.duration="6530.483000"
             vec![
                 Track {
                     index: 1,
-                    channels: 8
+                    channels: 8,
+                    title: None,
                 },
                 Track {
                     index: 2,
-                    channels: 8
+                    channels: 8,
+                    title: None,
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn a_title_that_names_the_old_codec_is_rewritten() {
+        let track = |title: &str, channels| Track {
+            index: 0,
+            channels,
+            title: Some(title.to_string()),
+        };
+        assert_eq!(
+            new_title(&track("JA DTS-HDMA 5.1", 6)).as_deref(),
+            Some("AC-3 5.1")
+        );
+        assert_eq!(
+            new_title(&track("TrueHD Atmos 7.1", 8)).as_deref(),
+            Some("AC-3 5.1")
+        );
+        assert_eq!(new_title(&track("Commentary", 2)), None);
+        assert_eq!(
+            new_title(&Track {
+                index: 0,
+                channels: 2,
+                title: None
+            }),
+            None
         );
     }
 
@@ -361,7 +456,7 @@ format.duration="6530.483000"
                 "-v",
                 "error",
                 "-show_entries",
-                "stream=codec_name",
+                "stream=codec_name:stream_tags=title",
                 "-of",
                 "csv=p=0",
             ])
@@ -370,9 +465,10 @@ format.duration="6530.483000"
             .expect("run ffprobe");
         let codecs = String::from_utf8_lossy(&codecs.stdout);
         assert!(
-            codecs.contains("ac3") && !codecs.contains("dts"),
+            codecs.contains("ac3") && !codecs.to_lowercase().contains("dts"),
             "{codecs}"
         );
+        assert!(codecs.contains("AC-3 1.0"), "the title follows: {codecs}");
 
         transcoder.work(&lib, &|| false, &|i| reported.lock().unwrap().push(i.id));
         assert_eq!(

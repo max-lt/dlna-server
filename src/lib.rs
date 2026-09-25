@@ -416,7 +416,8 @@ pub mod test_support {
         }
     }
 
-    /// A two-second clip with a DTS track, where ffmpeg is installed.
+    /// A two-second clip with a mono DTS track titled `DTS`, where ffmpeg is
+    /// installed.
     pub fn dts_clip(dir: &Path) -> Option<PathBuf> {
         let clip = dir.join("clip.mkv");
         // The DTS encoder is marked experimental, hence -strict -2.
@@ -425,6 +426,7 @@ pub mod test_support {
             .arg("testsrc=duration=2:size=64x64:rate=10")
             .args(["-f", "lavfi", "-i", "sine=duration=2"])
             .args(["-c:v", "mpeg4", "-c:a", "dca", "-strict", "-2"])
+            .args(["-metadata:s:a:0", "title=DTS"])
             .arg(&clip)
             .status();
         made.is_ok_and(|s| s.success()).then_some(clip)
