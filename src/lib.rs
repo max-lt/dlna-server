@@ -165,7 +165,7 @@ impl Server {
             port,
             root: config.root,
             lib: RwLock::new(Arc::new(library)),
-            update_id: AtomicU32::new(1),
+            update_id: AtomicU32::new(first_update_id()),
             events: Subscriptions::new(),
             thumbs: config.thumbnails.map(Thumbnails::new),
             transcoder: config.transcode.and_then(Transcoder::new),
@@ -264,6 +264,15 @@ impl Server {
     }
 }
 
+/// The clock in seconds. The UUID stays the same from one run to the next,
+/// so a TV that sees the SystemUpdateID of an earlier run shows the listing
+/// it cached then, files removed since included and files added missing.
+fn first_update_id() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_secs() as u32)
+}
+
 /// Path, size and mtime of an item's file: a replaced file gets a fresh
 /// thumbnail and a fresh conversion.
 pub(crate) fn cache_key(item: &Item) -> u64 {
@@ -326,10 +335,11 @@ mod tests {
             "{answer:?}"
         );
 
+        let first = srv.update_id();
         let (seq, body) = receive_notify(&tv);
         assert_eq!(seq, "0");
         assert!(
-            body.contains("<SystemUpdateID>1</SystemUpdateID>"),
+            body.contains(&format!("<SystemUpdateID>{first}</SystemUpdateID>")),
             "{body}"
         );
 
@@ -338,10 +348,31 @@ mod tests {
         let (seq, body) = receive_notify(&tv);
         assert_eq!(seq, "1");
         assert!(
-            body.contains("<SystemUpdateID>2</SystemUpdateID>"),
+            body.contains(&format!("<SystemUpdateID>{}</SystemUpdateID>", first + 1)),
             "{body}"
         );
         srv.shutdown();
+    }
+
+    /// A restart moves SystemUpdateID past the last run's, so a TV does not
+    /// keep the listing it cached from that run.
+    #[test]
+    fn a_restart_moves_the_update_id_on() {
+        let tmp = TempDir::new();
+        tmp.file("one.mp4", 1);
+        let before = Server::build(
+            Config::new("Test", tmp.path().to_path_buf()),
+            Ipv4Addr::LOCALHOST,
+            0,
+        );
+        before.changed();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let after = Server::build(
+            Config::new("Test", tmp.path().to_path_buf()),
+            Ipv4Addr::LOCALHOST,
+            0,
+        );
+        assert!(after.update_id() > before.update_id());
     }
 
     #[test]
