@@ -3,7 +3,7 @@
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -37,6 +37,7 @@ fn main() -> ExitCode {
 }
 
 fn run(options: Options) -> io::Result<()> {
+    log_launch();
     let interfaces = net::interfaces()?;
     let mut config = Config::new(options.name, options.dir);
     config.ip = options.ip;
@@ -120,6 +121,21 @@ fn run(options: Options) -> io::Result<()> {
     println!("\nshutting down, withdrawing announcements");
     srv.shutdown();
     Ok(())
+}
+
+/// A file per run in the temp directory, named by its start time, to tell runs apart.
+fn log_launch() {
+    let Some(stamp) = Command::new("date")
+        .arg("+%Y-%m-%d_%H-%M-%S")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!("dlna-server.{stamp}.log"));
+    let _ = std::fs::write(&path, format!("dlna-server started {stamp}\n"));
 }
 
 fn clock(duration: Duration) -> String {
