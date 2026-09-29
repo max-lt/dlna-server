@@ -3,7 +3,7 @@
 use crate::Server;
 use crate::gena::{self, Service};
 use crate::library::{Item, Kind};
-use crate::{FNV_OFFSET, fnv1a};
+use crate::{FNV_OFFSET, cache_key, fnv1a};
 use crate::{thumbs, transcode};
 
 /// `DLNA.ORG_OP=01` advertises byte-seek support, which is what makes a TV's
@@ -308,7 +308,8 @@ fn render(srv: &Server, item: &Item) -> String {
     let thumbnail = srv
         .thumbnails()
         .filter(|t| t.offered(item))
-        .map(|_| format!("{base}/thumb/{}.jpg", item.id));
+        // The key changes with the file, and an LG set caches art by URL.
+        .map(|_| format!("{base}/thumb/{}-{:016x}.jpg", item.id, cache_key(item)));
     if let Some(url) = &thumbnail {
         out.push_str(&format!(
             r#"<upnp:albumArtURI dlna:profileID="{}">{url}</upnp:albumArtURI>"#,
@@ -604,7 +605,7 @@ mod tests {
         let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
 
         assert!(page.contains("upnp:albumArtURI"));
-        assert_eq!(page.matches("/thumb/1.jpg").count(), 2);
+        assert_eq!(page.matches("/thumb/1-").count(), 2);
         assert!(page.contains("<TotalMatches>1</TotalMatches>"));
     }
 
@@ -621,7 +622,7 @@ mod tests {
         let srv = Server::build(config, Ipv4Addr::LOCALHOST, 8200);
         let (_, page) = browse(&srv, &request(0, "BrowseDirectChildren", 0, 0));
 
-        let res: Vec<usize> = ["/media/", "/sub/1.srt&lt;/res", "/thumb/1.jpg&lt;/res"]
+        let res: Vec<usize> = ["/media/", "/sub/1.srt&lt;/res", ".jpg&lt;/res"]
             .iter()
             .map(|marker| page.find(marker).expect(marker))
             .collect();

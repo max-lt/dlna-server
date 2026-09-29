@@ -225,7 +225,7 @@ fn serve_object(
     resource: Resource,
     body: Body,
 ) -> io::Result<()> {
-    let Some(id) = slug.split('.').next().and_then(|s| s.parse().ok()) else {
+    let Some(id) = slug.split(['.', '-']).next().and_then(|s| s.parse().ok()) else {
         return send(stream, 400, TEXT, &[], b"bad object id\n", body);
     };
     let lib = srv.library();
