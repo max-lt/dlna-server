@@ -22,19 +22,10 @@ const UNSUPPORTED: &[&str] = &["dts", "truehd", "mlp", "opus", "vorbis"];
 const MAX_CHANNELS: u32 = 6;
 /// Words in a track title that name the codec it had before, lowercase.
 const OLD_CODEC_WORDS: &[&str] = &["dts", "truehd", "atmos", "master audio", "opus", "vorbis"];
-/// Statistics mkvmerge writes per track; they describe the old codec's
-/// stream, bitrate and size included, and go stale once it is re-encoded.
-const STALE_TAGS: &[&str] = &[
-    "BPS",
-    "DURATION",
-    "NUMBER_OF_FRAMES",
-    "NUMBER_OF_BYTES",
-    "_STATISTICS_WRITING_APP",
-    "_STATISTICS_WRITING_DATE_UTC",
-    "_STATISTICS_TAGS",
-];
 pub const MIME: &str = "video/x-matroska";
 pub const EXTENSION: &str = "mkv";
+/// Part of the cache name: bump it when the recipe changes, or old files stay.
+const CACHE_VERSION: u32 = 5;
 
 pub struct Transcoder {
     cache: PathBuf,
@@ -66,6 +57,7 @@ struct Audio {
     codec: String,
     channels: u32,
     title: Option<String>,
+    language: Option<String>,
 }
 
 impl Transcoder {
@@ -102,9 +94,10 @@ impl Transcoder {
             let Some(tracks) = self.pending(item) else {
                 continue;
             };
-            let target = self
-                .cache
-                .join(format!("{:016x}-ac3.{EXTENSION}", cache_key(item)));
+            let target = self.cache.join(format!(
+                "{:016x}-ac3-v{CACHE_VERSION}.{EXTENSION}",
+                cache_key(item)
+            ));
             let done = target.is_file() || self.convert(item, &tracks, &target);
             let mut probed = self.probed.lock().unwrap();
             let Some(entry) = probed.get_mut(&item.path) else {
@@ -163,77 +156,33 @@ impl Transcoder {
         if fs::create_dir_all(&self.cache).is_err() {
             return false;
         }
-        let part = target.with_extension("part");
-        let mut command = Command::new("ffmpeg");
-        command
-            .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
-            .arg(&item.path)
-            .args(["-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "copy"]);
-        // Subtitles ride along from Matroska; MP4's mov_text cannot be copied
-        // into it and would sink the whole run.
-        if is_matroska(&item.path) {
-            command.args(["-map", "0:s?", "-c:s", "copy"]);
-        }
+        let Some(audio) = probe(&item.path).map(|flat| parse_probe(&flat)) else {
+            return false;
+        };
+
+        let mut encoded: Vec<(usize, PathBuf)> = Vec::new();
         for track in tracks {
-            let bitrate = if track.channels <= 2 { "256k" } else { "640k" };
-            command
-                .arg(format!("-c:a:{}", track.index))
-                .arg("ac3")
-                .arg(format!("-b:a:{}", track.index))
-                .arg(bitrate);
-            if track.channels > MAX_CHANNELS {
-                command
-                    .arg(format!("-ac:a:{}", track.index))
-                    .arg(MAX_CHANNELS.to_string());
-            }
-            // An empty value removes the tag.
-            for tag in STALE_TAGS {
-                for key in [tag.to_string(), format!("{tag}-eng")] {
-                    command
-                        .arg(format!("-metadata:s:a:{}", track.index))
-                        .arg(format!("{key}="));
+            let temp = target.with_extension(format!("t{}.ac3.part", track.index));
+            if !self.run(encode_track(&item.path, track, &temp)) {
+                for (_, done) in &encoded {
+                    let _ = fs::remove_file(done);
                 }
-            }
-            if let Some(title) = new_title(track) {
-                command
-                    .arg(format!("-metadata:s:a:{}", track.index))
-                    .arg(format!("title={title}"));
-            }
-        }
-        command
-            .args(["-f", "matroska"])
-            .arg(&part)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null());
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                eprintln!("transcode: ffmpeg: {err}");
+                let _ = fs::remove_file(&temp);
+                eprintln!(
+                    "transcode: ffmpeg: could not encode track {} of {}",
+                    track.index,
+                    item.path.display()
+                );
                 return false;
             }
-        };
-        *self.running.lock().unwrap() = Some(child);
+            encoded.push((track.index, temp));
+        }
 
-        // Polled rather than waited on, so `abort` can get at the child.
-        let succeeded = loop {
-            let mut running = self.running.lock().unwrap();
-            let Some(child) = running.as_mut() else {
-                break false;
-            };
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    running.take();
-                    break status.success();
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    running.take();
-                    break false;
-                }
-            }
-            drop(running);
-            thread::sleep(Duration::from_millis(200));
-        };
+        let part = target.with_extension("part");
+        let succeeded = self.run(remux(item, &audio, tracks, &encoded, &part));
+        for (_, temp) in &encoded {
+            let _ = fs::remove_file(temp);
+        }
         if succeeded && fs::rename(&part, target).is_ok() {
             return true;
         }
@@ -248,6 +197,104 @@ impl Transcoder {
         }
         false
     }
+
+    /// Blocks until `command` exits or `abort` kills it.
+    fn run(&self, mut command: Command) -> bool {
+        let child = match command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                eprintln!("transcode: ffmpeg: {err}");
+                return false;
+            }
+        };
+        *self.running.lock().unwrap() = Some(child);
+
+        // Polled rather than waited on, so `abort` can get at the child.
+        loop {
+            let mut running = self.running.lock().unwrap();
+            let Some(child) = running.as_mut() else {
+                return false;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    running.take();
+                    return status.success();
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    running.take();
+                    return false;
+                }
+            }
+            drop(running);
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+/// `track` alone, because ffmpeg drops the packets of a track it encodes
+/// while it copies several others into the same file.
+fn encode_track(video: &Path, track: &Track, temp: &Path) -> Command {
+    let bitrate = if track.channels <= 2 { "256k" } else { "640k" };
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+        .arg(video)
+        .arg("-map")
+        .arg(format!("0:a:{}", track.index))
+        .args(["-c:a", "ac3", "-b:a", bitrate]);
+    if track.channels > MAX_CHANNELS {
+        command.args(["-ac", &MAX_CHANNELS.to_string()]);
+    }
+    command.args(["-f", "ac3"]).arg(temp);
+    command
+}
+
+/// Copies every stream into `target`, each converted track taken from its
+/// file in `encoded` at its original position.
+fn remux(
+    item: &Item,
+    audio: &[Audio],
+    tracks: &[Track],
+    encoded: &[(usize, PathBuf)],
+    target: &Path,
+) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+        .arg(&item.path);
+    for (_, temp) in encoded {
+        command.arg("-i").arg(temp);
+    }
+    command.args(["-map", "0:v"]);
+    for index in 0..audio.len() {
+        let source = match encoded.iter().position(|(i, _)| *i == index) {
+            Some(input) => format!("{}:0", input + 1),
+            None => format!("0:a:{index}"),
+        };
+        command.arg("-map").arg(source);
+    }
+    // MP4's mov_text cannot be copied into Matroska and would sink the run.
+    if is_matroska(&item.path) {
+        command.args(["-map", "0:s?"]);
+    }
+    // Without it the encoded tracks land gigabytes away from their video, and
+    // a TV reading in order plays them mute.
+    command.args(["-c", "copy", "-max_interleave_delta", "0"]);
+    for track in tracks {
+        if let Some(title) = new_title(track) {
+            command
+                .arg(format!("-metadata:s:a:{}", track.index))
+                .arg(format!("title={title}"));
+        }
+        if let Some(language) = audio[track.index].language.as_deref() {
+            command
+                .arg(format!("-metadata:s:a:{}", track.index))
+                .arg(format!("language={language}"));
+        }
+    }
+    command.args(["-f", "matroska"]).arg(target);
+    command
 }
 
 fn is_matroska(path: &Path) -> bool {
@@ -261,7 +308,7 @@ fn probe(path: &Path) -> Option<String> {
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,codec_name,channels:stream_tags=title",
+            "stream=codec_type,codec_name,channels:stream_tags=title,language",
             "-of",
             "flat",
         ])
@@ -299,6 +346,7 @@ fn parse_probe(flat: &str) -> Vec<Audio> {
             "codec_name" => stream.1.codec = value.to_string(),
             "channels" => stream.1.channels = value.parse().unwrap_or(0),
             "tags.title" => stream.1.title = Some(value.to_string()),
+            "tags.language" => stream.1.language = Some(value.to_string()),
             _ => {}
         }
     }
@@ -368,6 +416,7 @@ format.duration="6530.483000"
                 codec: "dts".to_string(),
                 channels: 2,
                 title: Some("DTS 2.0".to_string()),
+                language: None,
             }]
         );
     }
@@ -380,6 +429,7 @@ format.duration="6530.483000"
                     codec: c.to_string(),
                     channels: *n,
                     title: None,
+                    language: None,
                 })
                 .collect()
         };
